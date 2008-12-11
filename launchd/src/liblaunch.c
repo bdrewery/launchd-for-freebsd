@@ -208,16 +208,26 @@ launch_client_init(void)
 		memset(&sun, 0, sizeof(sun));
 		sun.sun_family = AF_UNIX;
 		
+		/* The rules are as follows. 
+		 * - All users (including root) talk to their per-user launchd's by default.
+		 * - If we have been invoked under sudo, talk to the system launchd.
+		 * - If we're the root user and the __USE_SYSTEM_LAUNCHD environment variable is set, then
+		 *   talk to the system launchd.
+		 */
 		if (where && where[0] != '\0') {
 			strncpy(sun.sun_path, where, sizeof(sun.sun_path));
-		} else if ((!getenv("SUDO_COMMAND") || geteuid() != 0) && _vprocmgr_getsocket(spath) == 0) {
-			size_t min_len;
-
-			min_len = sizeof(sun.sun_path) < sizeof(spath) ? sizeof(sun.sun_path) : sizeof(spath);
-
-			strncpy(sun.sun_path, spath, min_len);	
 		} else {
-			strncpy(sun.sun_path, LAUNCHD_SOCK_PREFIX "/sock", sizeof(sun.sun_path));
+			if( (getenv("SUDO_COMMAND") || getenv("__USE_SYSTEM_LAUNCHD")) && geteuid() == 0 ) {
+				/* Talk to the system launchd. */
+				strncpy(sun.sun_path, LAUNCHD_SOCK_PREFIX "/sock", sizeof(sun.sun_path));
+			} else if( _vprocmgr_getsocket(spath) == 0 ) {
+				/* Talk to our per-user launchd. */
+				size_t min_len;
+				
+				min_len = sizeof(sun.sun_path) < sizeof(spath) ? sizeof(sun.sun_path) : sizeof(spath);
+				
+				strncpy(sun.sun_path, spath, min_len);
+			}
 		}
 
 		if ((lfd = _fd(socket(AF_UNIX, SOCK_STREAM, 0))) == -1) {
@@ -1264,27 +1274,6 @@ create_and_switch_to_per_session_launchd(const char *login __attribute__((unused
 	if (_vprocmgr_move_subset_to_user(target_user, "Aqua")) {
 		return -1;
 	}
-
-#define BEZEL_UI_HACK
-#ifdef BEZEL_UI_HACK
-	#define BEZEL_UI_PATH "/System/Library/LoginPlugins/BezelServices.loginPlugin/Contents/Resources/BezelUI/BezelUIServer"
-	#define BEZEL_UI_PLIST "/System/Library/LaunchAgents/com.apple.BezelUIServer.plist"
-	#define BEZEL_UI_SERVICE "BezelUI"
-
-	mach_port_t bezel_ui_server;
-	struct stat sb;
-	if (!(stat(BEZEL_UI_PLIST, &sb) == 0 && S_ISREG(sb.st_mode))) {
-		if (bootstrap_create_server(bootstrap_port, BEZEL_UI_PATH, target_user, true, &bezel_ui_server) == BOOTSTRAP_SUCCESS) {
-			mach_port_t srv;
-
-			if (bootstrap_check_in(bezel_ui_server, BEZEL_UI_SERVICE, &srv) == BOOTSTRAP_SUCCESS) {
-				mach_port_mod_refs(mach_task_self(), srv, MACH_PORT_RIGHT_RECEIVE, -1);
-			}
-
-			mach_port_deallocate(mach_task_self(), bezel_ui_server);
-		}
-	}
-#endif
 
 	return 1;
 }

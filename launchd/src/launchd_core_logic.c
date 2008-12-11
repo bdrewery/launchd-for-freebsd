@@ -569,6 +569,7 @@ static size_t our_strhash(const char *s) __attribute__((pure));
 static void extract_rcsid_substr(const char *i, char *o, size_t osz);
 static void do_first_per_user_launchd_hack(void);
 static void do_unmounts(void);
+void eliminate_double_reboot(void);
 
 /* file local globals */
 static size_t total_children;
@@ -652,7 +653,8 @@ job_stop(job_t j)
 	if (unlikely(!j->p || j->anonymous)) {
 		return;
 	}
-
+	
+#if !TARGET_OS_EMBEDDED
 	if (j->kill_via_shmem && !g_force_old_kill_path) {
 		if (j->shmem) {
 			if (!j->sent_kill_via_shmem) {
@@ -668,6 +670,7 @@ job_stop(job_t j)
 	} else if( j->kill_via_shmem ) {
 		job_log(j, LOG_DEBUG, "Stopping transactional job the old-fashioned way.");
 	}
+#endif
 
 	j->sent_signal_time = runtime_get_opaque_time();
 
@@ -1007,13 +1010,14 @@ jobmgr_remove(jobmgr_t jm, bool expect_real_jobs)
 		runtime_del_weak_ref();
 		SLIST_REMOVE(&jm->parentmgr->submgrs, jm, jobmgr_s, sle);
 	} else if (pid1_magic) {
+		eliminate_double_reboot();
 		jobmgr_log(jm, LOG_DEBUG | LOG_CONSOLE, "About to call: sync()");
 		sync(); /* We're are going to rely on log timestamps to benchmark this call */
 		jobmgr_log(jm, LOG_DEBUG | LOG_CONSOLE, "Unmounting all filesystems except / and /dev");
 		do_unmounts();
 		launchd_log_vm_stats();
-		runtime_closelog();
 		jobmgr_log(root_jobmgr, LOG_NOTICE | LOG_CONSOLE, "About to call: reboot(%s).", reboot_flags_to_C_names(jm->reboot_flags));
+		runtime_closelog();
 		jobmgr_assumes(jm, reboot(jm->reboot_flags) != -1);
 		runtime_closelog();
 	} else {
@@ -2567,7 +2571,7 @@ job_reap(job_t j)
 		td_sec = td / NSEC_PER_SEC;
 		td_usec = (td % NSEC_PER_SEC) / NSEC_PER_USEC;
 
-		job_log(j, LOG_NOTICE, "Exited %llu.%06llu seconds after the first signal was sent", td_sec, td_usec);
+		job_log(j, LOG_DEBUG, "Exited %llu.%06llu seconds after the first signal was sent", td_sec, td_usec);
 	}
 
 	timeradd(&ru.ru_utime, &j->ru.ru_utime, &j->ru.ru_utime);
@@ -3097,6 +3101,9 @@ job_callback_timer(job_t j, void *ident)
 		j->start_pending = true;
 		job_dispatch(j, false);
 	} else if (&j->exit_timeout == ident) {
+		if( !job_assumes(j, j->p != 0) ) {
+			return;
+		}
 		/*
 		 * This block might be executed up to 3 times for a given (slow) job
 		 *  - once for the SAMPLE_TIMEOUT timer, at which point sampling is triggered
@@ -4351,7 +4358,7 @@ semaphoreitem_callback(job_t j, struct kevent *kev)
 			j->start_pending = true;
 		}
 	} else { /* Something happened to the parent directory. See if our target file appeared. */
-		if( !invalidation_reason[0] ){
+		if( !invalidation_reason[0] ) {
 			job_assumes(j, runtime_close(si->fd) == 0);
 			si->fd = -1; /* this will get fixed in semaphoreitem_watch() */
 			semaphoreitem_watch(j, si);
@@ -5364,11 +5371,15 @@ jobmgr_log_stray_children(jobmgr_t jm)
 			continue;
 		}
 		
-		/* We might have some jobs hanging around that we've decided to shut down in spite of. If so, don't bother trying to kill them again. */
+		/* We might have some jobs hanging around that we've decided to shut down in spite of. */
 		job_t j = jobmgr_find_by_pid(jm, p_i, false);
 		if( !j || (j && j->anonymous) ) {
 			jobmgr_log(jm, LOG_WARNING, "Stray %s %s at shutdown: PID %u PPID %u PGID %u %s", z, j ? "anonymous job" : "process", p_i, pp_i, pg_i, n);
-			jobmgr_kill_stray_child(jm, p_i);
+			
+			/* <rdar://problem/6399100> Let the kernel clean up the stragglers. */
+			if( 0 ) {
+				jobmgr_kill_stray_child(jm, p_i);
+			}
 		}
 	}
 
@@ -5536,8 +5547,13 @@ jobmgr_init_session(jobmgr_t jm, const char *session_type, bool sflag)
 		envitem_new(bootstrapper, "__CF_USER_TEXT_ENCODING", buf, false);
 		bootstrapper->weird_bootstrap = true;
 		jobmgr_assumes(jm, job_setup_machport(bootstrapper));
+	} else if( bootstrapper && strncmp(session_type, VPROCMGR_SESSION_SYSTEM, sizeof(VPROCMGR_SESSION_SYSTEM)) == 0 ) {
+		if( jobmgr_assumes(jm, pid1_magic) ) {
+			/* Have our system bootstrapper print out to the console. */
+			bootstrapper->stdoutpath = _PATH_CONSOLE;
+		}
 	}
-
+	
 	jm->session_initialized = true;
 
 	return bootstrapper;
@@ -5708,7 +5724,7 @@ machservice_delete(job_t j, struct machservice *ms, bool port_died)
 	}
 
 	if (ms->recv && job_assumes(j, !machservice_active(ms))) {
-		job_log(j, LOG_NOTICE, "Closing receive right for %s", ms->name);
+		job_log(j, LOG_DEBUG, "Closing receive right for %s", ms->name);
 		job_assumes(j, launchd_mport_close_recv(ms->port) == KERN_SUCCESS);
 	}
 
@@ -5718,7 +5734,7 @@ machservice_delete(job_t j, struct machservice *ms, bool port_died)
 		the_exception_server = 0;
 	}
 
-	job_log(j, LOG_NOTICE, "Mach service deleted%s: %s", port_died ? " (port died)" : "", ms->name);
+	job_log(j, LOG_DEBUG, "Mach service deleted%s: %s", port_died ? " (port died)" : "", ms->name);
 
 	if (ms->special_port_num) {
 		SLIST_REMOVE(&special_ports, ms, machservice, special_port_sle);
@@ -6350,14 +6366,14 @@ job_mig_send_signal(job_t j, mach_port_t srp, name_t targetlabel, int sig)
 			job_assumes(j, runtime_kill(otherj->p, SIGKILL) != -1);
 			return 0;
 		}
-
+	#if !TARGET_OS_EMBEDDED
 		if (__sync_bool_compare_and_swap(&j->shmem->vp_shmem_transaction_cnt, 0, -1)) {
 			j->shmem->vp_shmem_flags |= VPROC_SHMEM_EXITING;
 			j->sent_kill_via_shmem = true;
 			job_assumes(j, runtime_kill(otherj->p, SIGKILL) != -1);
 			return 0;
 		}
-
+	#endif
 		return BOOTSTRAP_NOT_PRIVILEGED;
 	} else if (otherj->p) {
 		job_assumes(j, runtime_kill(otherj->p, sig) != -1);
@@ -6643,7 +6659,7 @@ job_mig_swap_integer(job_t j, vproc_gsk_t inkey, vproc_gsk_t outkey, int64_t inv
 		}
 	case VPROC_GSK_WEIRD_BOOTSTRAP:
 		if( job_assumes(j, j->weird_bootstrap) ) {
-			job_log(j, LOG_NOTICE, "Unsetting weird bootstrap.");
+			job_log(j, LOG_DEBUG, "Unsetting weird bootstrap.");
 			
 			mach_msg_size_t mxmsgsz = (typeof(mxmsgsz)) sizeof(union __RequestUnion__job_mig_protocol_vproc_subsystem);
 			
@@ -7506,18 +7522,31 @@ out:
 }
 
 kern_return_t
-job_mig_detach_from_console(job_t j, mach_port_t *new_bsport)
+job_mig_switch_to_session(job_t j, mach_port_t requestor_port, name_t session_name, mach_port_t *new_bsport)
 {
-	if( j->mgr == root_jobmgr ) {
+	job_log(j, LOG_NOTICE, "Job wants to move to %s session.", session_name);
+	
+	if( !job_assumes(j, pid1_magic == false) ) {
+		job_log(j, LOG_WARNING, "Switching sessions is not allowed in the system Mach bootstrap.");
 		return BOOTSTRAP_NOT_PRIVILEGED;
 	}
 	
 	if( !j->anonymous ) {
-		job_log(j, LOG_NOTICE, "Non-anonymous job tried to move to Background session. Please set LimitLoadToSessionType in the launchd property list to \"Background\" instead.");
+		job_log(j, LOG_NOTICE, "Non-anonymous job tried to switch sessions. Please use LimitLoadToSessionType instead.");
 		return BOOTSTRAP_NOT_PRIVILEGED;
 	}
 	
-	job_log(j, LOG_NOTICE, "Detaching from console session.");
+	jobmgr_t target_jm = jobmgr_find_by_name(root_jobmgr, session_name);
+	if( target_jm == j->mgr ) {
+		job_log(j, LOG_WARNING, "Job tried to switch to its current session (%s).", session_name);
+		return BOOTSTRAP_NOT_PRIVILEGED;
+	}
+	
+	target_jm = target_jm ? : jobmgr_new(j->mgr, requestor_port, MACH_PORT_NULL, false, session_name);
+	if( !job_assumes(j, target_jm != NULL) ) {
+		job_log(j, LOG_WARNING, "Could not find %s session!", session_name);
+		return BOOTSTRAP_NO_MEMORY;
+	}
 	
 	/* Remove the job from it's current job manager. */
 	LIST_REMOVE(j, sle);
@@ -7531,25 +7560,25 @@ job_mig_detach_from_console(job_t j, mach_port_t *new_bsport)
 		}
 	}
 	
-	/* Put the job into the background job manager. */
-	LIST_INSERT_HEAD(&root_jobmgr->jobs, j, sle);
-	LIST_INSERT_HEAD(&root_jobmgr->active_jobs[ACTIVE_JOB_HASH(j->p)], j, pid_hash_sle);
+	/* Put the job into the target job manager. */
+	LIST_INSERT_HEAD(&target_jm->jobs, j, sle);
+	LIST_INSERT_HEAD(&target_jm->active_jobs[ACTIVE_JOB_HASH(j->p)], j, pid_hash_sle);
 	
 	if( ji ) {
-		LIST_INSERT_HEAD(&root_jobmgr->global_env_jobs, j, global_env_sle);
+		LIST_INSERT_HEAD(&target_jm->global_env_jobs, j, global_env_sle);
 	}
 	
-	/* Move our Mach services over. */
+	/* Move our Mach services over if we're not in a flat namespace. */
 	if( !g_flat_mach_namespace && !SLIST_EMPTY(&j->machservices) ) {
 		struct machservice *msi = NULL, *msit = NULL;
 		SLIST_FOREACH_SAFE( msi, &j->machservices, sle, msit ) {
 			LIST_REMOVE(msi, name_hash_sle);
-			LIST_INSERT_HEAD(&root_jobmgr->ms_hash[hash_ms(msi->name)], msi, name_hash_sle);
+			LIST_INSERT_HEAD(&target_jm->ms_hash[hash_ms(msi->name)], msi, name_hash_sle);
 		}
 	}
 	
-	j->mgr = root_jobmgr;
-	*new_bsport = root_jobmgr->jm_port;
+	j->mgr = target_jm;
+	*new_bsport = target_jm->jm_port;
 	
 	return KERN_SUCCESS;
 }
@@ -7726,7 +7755,7 @@ job_mig_subset(job_t j, mach_port_t requestorport, mach_port_t *subsetportp)
 	*subsetportp = jmr->jm_port;
 	jmr->created_via_subset = true;
 	
-	job_log(j, LOG_NOTICE, "Job created a subset named \"%s\"", jmr->name);
+	job_log(j, LOG_DEBUG, "Job created a subset named \"%s\"", jmr->name);
 	return BOOTSTRAP_SUCCESS;
 }
 
@@ -8102,4 +8131,58 @@ get_kern_max_proc(void)
 	launchd_assumes(sysctl(mib, 2, &max, &max_sz, NULL, 0) != -1);
 	
 	return max;
+}
+
+/* See rdar://problem/6271234 */
+void
+eliminate_double_reboot(void)
+{
+	if( unlikely(!pid1_magic) ) {
+		return;
+	}
+	
+	struct stat sb;
+	const char *argv[] = { "/etc/rc.deferredinstall", NULL };
+	char *try_again = "Will try again at next boot.";
+	int result = ~0;
+	
+	if( unlikely(stat(argv[0], &sb) != -1) ) {
+		jobmgr_log(root_jobmgr, LOG_DEBUG | LOG_CONSOLE, "Going to run deferred install script.");
+		
+		int wstatus;
+		pid_t p;
+		
+		jobmgr_assumes(root_jobmgr, (errno = posix_spawnp(&p, argv[0], NULL, NULL, (char **)argv, environ)) == 0);
+		
+		if (errno) {
+			jobmgr_log(root_jobmgr, LOG_WARNING | LOG_CONSOLE, "Couldn't run deferred install script! %s", try_again);
+			goto out;
+		}
+		
+		if( !jobmgr_assumes(root_jobmgr, waitpid(p, &wstatus, 0) != -1) ) {
+			jobmgr_log(root_jobmgr, LOG_WARNING | LOG_CONSOLE, "Couldn't confirm that deferred install script exited successfully! %s", try_again);
+			goto out;
+		}
+		
+		if( jobmgr_assumes(root_jobmgr, WIFEXITED(wstatus) != 0) ) {
+			if( jobmgr_assumes(root_jobmgr, (result = WEXITSTATUS(wstatus)) == EXIT_SUCCESS) ) {
+				jobmgr_log(root_jobmgr, LOG_DEBUG | LOG_CONSOLE, "Deferred install script completed successfully.");
+			} else {
+				jobmgr_log(root_jobmgr, LOG_WARNING | LOG_CONSOLE, "Deferred install script exited with status %d. %s", WEXITSTATUS(wstatus), try_again);
+			}
+		} else {
+			jobmgr_log(root_jobmgr, LOG_WARNING | LOG_CONSOLE, "Confirmed that deferred install script exited, but couldn't confirm that it was successful. %s", try_again);
+		}
+	}
+out:
+	if( result == 0 ) {
+		/* If the unlink(2) was to fail, it would be most likely fail with EBUSY. All the other
+		 * failure cases for unlink(2) don't apply when we're running under PID 1 and have verified
+		 * that the file exists. Outside of someone deliberately messing with us (like if /etc/rc.deferredinstall
+		 * is actually a looping sym-link or a mount point for a filesystem) and I/O errors, we should be good.
+		 */
+		if( !jobmgr_assumes(root_jobmgr, unlink(argv[0]) != -1) ) {
+			jobmgr_log(root_jobmgr, LOG_WARNING | LOG_CONSOLE, "Deferred install script couldn't be removed!");
+		}
+	}
 }

@@ -200,9 +200,11 @@ main(int argc, char *const *argv)
 	if (pid1_magic) {
 		handle_pid1_crashes_separately();
 	} else {
+	#if !TARGET_OS_EMBEDDED
 		/* prime shared memory before the 'bootstrap_port' global is set to zero */
 		_vproc_transaction_begin();
 		_vproc_transaction_end();
+	#endif
 	}
 
 	if( pid1_magic ) {
@@ -213,7 +215,7 @@ main(int argc, char *const *argv)
 	}
 
 	jobmgr_init(sflag);
-
+	
 	launchd_runtime_init2();
 
 	launchd_runtime();

@@ -182,8 +182,10 @@ out 			__child_ports		: mach_port_move_send_array_t, dealloc;
 out				__child_names		: name_array_t, dealloc;
 out				__child_properties	: bootstrap_property_array_t, dealloc);
 
-routine detach_from_console(
+routine switch_to_session(
 				__bs_port			: job_t;
+				__req_port			: mach_port_t;
+				__session_name		: name_t;
 out				__new_bs_port		: mach_port_make_send_t);
 
 routine transaction_count_for_pid(

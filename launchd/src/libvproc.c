@@ -69,17 +69,38 @@ vproc_shmem_init(void)
 	kr = vproc_mig_setup_shmem(bootstrap_port, &shmem_port);
 
 	//assert(kr == 0);
-	if (kr) return;
-
-	kr = vm_map(mach_task_self(), &vm_addr, getpagesize(), 0, true, shmem_port, 0, false,
-			VM_PROT_READ|VM_PROT_WRITE, VM_PROT_READ|VM_PROT_WRITE, VM_INHERIT_NONE);
-
-	//assert(kr == 0);
-	if (kr) return;
-
-	kr = mach_port_deallocate(mach_task_self(), shmem_port);
-
-	//assert(kr == 0);
+	if (kr) {
+		/* rdar://problem/6416724
+		 * If we fail to set up a shared memory page, just allocate a local chunk
+		 * of memory. This way, processes can still introspect their own transaction
+		 * counts if they're being run under a debugger. Moral of the story: Debug
+		 * from the environment you intend to run in.
+		 */
+		void *_vm_addr = malloc(sizeof(struct vproc_shmem_s));
+		if( !_vm_addr ) {
+			return;
+		}
+		
+		_vproc_log(LOG_WARNING,
+					"Using private memory for transactions. You are likely running under a launchd agent or daemon under a debugger.\n"
+					"Please keep the following considerations in mind.\n"
+					"0. This process is not actually participating in Instant Off. It will only be able to keep track of its transaction count.\n"
+					"1. This process will not die after cleaning up its last transaction after it has received SIGTERM.\n"
+					"2. You are debugging your program in an environment that is very different from the one it will run under.\n"
+					"3. You can use the WaitForDebugger key to stall execution of your daemon or agent so that you can attach to it. See launchd.plist(5). "
+					"This only applies if you are debugging a launchd daemon or agent. If you are debugging a GUI application under Xcode, this consideration does not apply.\n");
+		vm_addr = (vm_address_t)_vm_addr;
+	} else {
+		kr = vm_map(mach_task_self(), &vm_addr, getpagesize(), 0, true, shmem_port, 0, false,
+					VM_PROT_READ|VM_PROT_WRITE, VM_PROT_READ|VM_PROT_WRITE, VM_INHERIT_NONE);
+		
+		//assert(kr == 0);
+		if (kr) return;
+		
+		kr = mach_port_deallocate(mach_task_self(), shmem_port);
+		
+		//assert(kr == 0);
+	}
 
 	vproc_shmem = (struct vproc_shmem_s *)vm_addr;
 }
@@ -101,8 +122,9 @@ vproc_transaction_t
 vproc_transaction_begin(vproc_t vp __attribute__((unused)))
 {
 	vproc_transaction_t vpt = (vproc_transaction_t)vproc_shmem_init; /* we need a "random" variable that is testable */
-
+#if !TARGET_OS_EMBEDDED
 	_vproc_transaction_begin();
+#endif
 
 	return vpt;
 }
@@ -110,6 +132,7 @@ vproc_transaction_begin(vproc_t vp __attribute__((unused)))
 void
 _vproc_transaction_begin(void)
 {
+#if !TARGET_OS_EMBEDDED
 	if (unlikely(vproc_shmem == NULL)) {
 		int po_r = pthread_once(&shmem_inited, vproc_client_init);
 		if (po_r != 0 || vproc_shmem == NULL) {
@@ -133,6 +156,7 @@ _vproc_transaction_begin(void)
 	} while( !__sync_bool_compare_and_swap(&vproc_shmem->vp_shmem_transaction_cnt, old, old + 1) );
 	
 	runtime_ktrace(RTKT_VPROC_TRANSACTION_INCREMENT, old + 1, 0, 0);
+#endif
 }
 
 size_t
@@ -174,6 +198,7 @@ _vproc_transaction_count_for_pid(pid_t p, int32_t *count, bool *condemned)
 }
 
 void
+#if !TARGET_OS_EMBEDDED
 _vproc_transaction_try_exit(int status)
 {
 	if (unlikely(vproc_shmem == NULL)) {
@@ -185,6 +210,12 @@ _vproc_transaction_try_exit(int status)
 		_exit(status);
 	}
 }
+#else
+_vproc_transaction_try_exit(int status __attribute__((unused)))
+{
+	
+}
+#endif
 
 void
 vproc_transaction_end(vproc_t vp __attribute__((unused)), vproc_transaction_t vpt)
@@ -194,12 +225,15 @@ vproc_transaction_end(vproc_t vp __attribute__((unused)), vproc_transaction_t vp
 		abort();
 	}
 
+#if !TARGET_OS_EMBEDDED
 	_vproc_transaction_end();
+#endif
 }
 
 void
 _vproc_transaction_end(void)
 {
+#if !TARGET_OS_EMBEDDED
 	typeof(vproc_shmem->vp_shmem_transaction_cnt) newval;
 
 	if (unlikely(vproc_shmem == NULL)) {
@@ -218,6 +252,7 @@ _vproc_transaction_end(void)
 		}
 		abort();
 	}
+#endif
 }
 
 vproc_standby_t
@@ -414,12 +449,14 @@ _vprocmgr_move_subset_to_user(uid_t target_user, const char *session_type)
 	return !issetugid() ? _vproc_post_fork_ping() : NULL;
 }
 
-vproc_err_t 
-_vprocmgr_detach_from_console(uint32_t flags __attribute__((unused)))
+vproc_err_t
+_vprocmgr_switch_to_session(const char *target_session, vproc_flags_t flags __attribute__((unused)))
 {
 	mach_port_t new_bsport = MACH_PORT_NULL;
-	if( vproc_mig_detach_from_console(bootstrap_port, &new_bsport) != KERN_SUCCESS ) {
-		return (vproc_err_t)_vprocmgr_detach_from_console;
+	kern_return_t kr = KERN_FAILURE;
+	if( (kr = vproc_mig_switch_to_session(bootstrap_port, mach_task_self(), (char *)target_session, &new_bsport)) != KERN_SUCCESS ) {
+		_vproc_log(LOG_NOTICE, "_vprocmgr_switch_to_session(): kr = 0x%x", kr);
+		return (vproc_err_t)_vprocmgr_switch_to_session;
 	}
 	
 	task_set_bootstrap_port(mach_task_self(), new_bsport);
@@ -427,6 +464,12 @@ _vprocmgr_detach_from_console(uint32_t flags __attribute__((unused)))
 	bootstrap_port = new_bsport;
 	
 	return !issetugid() ? _vproc_post_fork_ping() : NULL;
+}
+
+vproc_err_t 
+_vprocmgr_detach_from_console(vproc_flags_t flags __attribute__((unused)))
+{
+	return _vprocmgr_switch_to_session(VPROCMGR_SESSION_BACKGROUND, 0);
 }
 
 pid_t

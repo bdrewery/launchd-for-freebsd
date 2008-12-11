@@ -90,6 +90,7 @@ void _vproc_logv(int pri, int err, const char *msg, va_list ap) __attribute__((f
 #define VPROCMGR_SESSION_SYSTEM			"System"
 
 vproc_err_t _vprocmgr_move_subset_to_user(uid_t target_user, const char *session_type);
+vproc_err_t _vprocmgr_switch_to_session(const char *target_session, vproc_flags_t flags);
 vproc_err_t _vprocmgr_detach_from_console(vproc_flags_t flags);
 
 void _vproc_standby_begin(void)																__OSX_AVAILABLE_STARTING(__MAC_10_6, __IPHONE_NA);

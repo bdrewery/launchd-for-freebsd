@@ -592,10 +592,7 @@ x_handle_kqueue(mach_port_t junk __attribute__((unused)), integer_t fd)
 			kevi = &kev[i];
 
 			if (kevi->filter) {
-/* Leave on for SnowLeopard development. We should really try and identify what bugs would 
- * cause kevi->udata to be invalid.
- */
-#if 1
+#if 0
 				Dl_info dli;
 
 				/* Check if kevi->udata was either malloc(3)ed or is a valid function pointer. 
@@ -606,7 +603,7 @@ x_handle_kqueue(mach_port_t junk __attribute__((unused)), integer_t fd)
 				runtime_ktrace(RTKT_LAUNCHD_BSD_KEVENT|DBG_FUNC_START, kevi->ident, kevi->filter, kevi->fflags);
 				(*((kq_callback *)kevi->udata))(kevi->udata, kevi);
 				runtime_ktrace0(RTKT_LAUNCHD_BSD_KEVENT|DBG_FUNC_END);
-#if 1
+#if 0
 				} else {
 					log_kevent_struct(LOG_EMERG, kevi, i);
 				}
@@ -1073,7 +1070,11 @@ launchd_runtime2(mach_msg_size_t msg_size, mig_reply_error_t *bufRequest, mig_re
 			tmp_options |= MACH_RCV_TIMEOUT;
 
 			if (!(tmp_options & MACH_SEND_TIMEOUT)) {
+			#if !TARGET_OS_EMBEDDED
 				to = busy_cnt ? runtime_idle_timeout : (_vproc_standby_timeout() * 1000);
+			#else
+				to = runtime_idle_timeout;
+			#endif
 			}
 		}
 
@@ -1510,7 +1511,9 @@ void
 runtime_add_ref(void)
 {
 	if (!pid1_magic) {
+	#if !TARGET_OS_EMBEDDED
 		_vproc_transaction_begin();
+	#endif
 	}
 	runtime_busy_cnt++;
 }
@@ -1519,7 +1522,9 @@ void
 runtime_del_ref(void)
 {
 	if (!pid1_magic) {
+	#if !TARGET_OS_EMBEDDED
 		_vproc_transaction_end();
+	#endif
 	}
 	runtime_busy_cnt--;
 }
@@ -1528,7 +1533,9 @@ void
 runtime_add_weak_ref(void)
 {
 	if (!pid1_magic) {
+	#if !TARGET_OS_EMBEDDED
 		_vproc_standby_begin();
+	#endif
 	}
 	runtime_standby_cnt++;
 }
@@ -1537,7 +1544,9 @@ void
 runtime_del_weak_ref(void)
 {
 	if (!pid1_magic) {
+	#if !TARGET_OS_EMBEDDED
 		_vproc_standby_end();
+	#endif
 	}
 	runtime_standby_cnt--;
 }
