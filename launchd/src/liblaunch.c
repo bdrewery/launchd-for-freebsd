@@ -217,31 +217,35 @@ launch_client_init(void)
 		if (where && where[0] != '\0') {
 			strncpy(sun.sun_path, where, sizeof(sun.sun_path));
 		} else {
-			if( (getenv("SUDO_COMMAND") || getenv("__USE_SYSTEM_LAUNCHD")) && geteuid() == 0 ) {
-				/* Talk to the system launchd. */
-				strncpy(sun.sun_path, LAUNCHD_SOCK_PREFIX "/sock", sizeof(sun.sun_path));
-			} else if( _vprocmgr_getsocket(spath) == 0 ) {
-				/* Talk to our per-user launchd. */
-				size_t min_len;
-				
-				min_len = sizeof(sun.sun_path) < sizeof(spath) ? sizeof(sun.sun_path) : sizeof(spath);
-				
-				strncpy(sun.sun_path, spath, min_len);
+			if( _vprocmgr_getsocket(spath) == 0 ) {
+				if( (getenv("SUDO_COMMAND") || getenv("__USE_SYSTEM_LAUNCHD")) && geteuid() == 0 ) {
+					/* Talk to the system launchd. */
+					strncpy(sun.sun_path, LAUNCHD_SOCK_PREFIX "/sock", sizeof(sun.sun_path));
+				} else {
+					/* Talk to our per-user launchd. */
+					size_t min_len;
+					
+					min_len = sizeof(sun.sun_path) < sizeof(spath) ? sizeof(sun.sun_path) : sizeof(spath);
+					
+					strncpy(sun.sun_path, spath, min_len);
+				}
 			}
 		}
-
+		
 		if ((lfd = _fd(socket(AF_UNIX, SOCK_STREAM, 0))) == -1) {
 			goto out_bad;
 		}
-			
 		if (-1 == connect(lfd, (struct sockaddr *)&sun, sizeof(sun))) {
 			goto out_bad;
 		}
 	}
-	if (!(_lc->l = launchd_fdopen(lfd)))
+	
+	if (!(_lc->l = launchd_fdopen(lfd))) {
 		goto out_bad;
-	if (!(_lc->async_resp = launch_data_alloc(LAUNCH_DATA_ARRAY)))
+	}
+	if (!(_lc->async_resp = launch_data_alloc(LAUNCH_DATA_ARRAY))) {
 		goto out_bad;
+	}
 
 	return;
 out_bad:

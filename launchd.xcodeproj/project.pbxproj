@@ -999,6 +999,7 @@
 				PREBINDING = NO;
 				PRODUCT_NAME = launchd;
 				STRIP_STYLE = debugging;
+				VALID_ARCHS = "armv5 armv6 armv7 i386 ppc ppc64 ppc7400 ppc970 x86_64";
 				ZERO_LINK = NO;
 			};
 			name = Release;
@@ -1025,6 +1026,7 @@
 				);
 				PRODUCT_NAME = launch;
 				PUBLIC_HEADERS_FOLDER_PATH = /usr/include;
+				VALID_ARCHS = "armv5 armv6 armv7 i386 ppc ppc64 ppc7400 ppc970 x86_64";
 				VERSIONING_SYSTEM = "apple-generic";
 				VERSION_INFO_PREFIX = __;
 			};
@@ -1042,6 +1044,7 @@
 				PREBINDING = NO;
 				PRODUCT_NAME = launchctl;
 				STRIP_STYLE = debugging;
+				VALID_ARCHS = "armv5 armv6 armv7 i386 ppc ppc64 ppc7400 ppc970 x86_64";
 				ZERO_LINK = NO;
 			};
 			name = Release;
@@ -1095,6 +1098,7 @@
 				PREBINDING = NO;
 				PRODUCT_NAME = launchproxy;
 				STRIP_STYLE = debugging;
+				VALID_ARCHS = "armv5 armv6 armv7 i386 ppc ppc64 ppc7400 ppc970 x86_64";
 				ZERO_LINK = NO;
 			};
 			name = Release;
@@ -1110,6 +1114,7 @@
 				PREBINDING = NO;
 				PRODUCT_NAME = wait4path;
 				STRIP_STYLE = debugging;
+				VALID_ARCHS = "armv5 armv6 armv7 i386 ppc ppc64 ppc7400 ppc970 x86_64";
 				ZERO_LINK = NO;
 			};
 			name = Release;

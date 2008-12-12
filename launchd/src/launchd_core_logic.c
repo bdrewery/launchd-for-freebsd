@@ -4228,7 +4228,6 @@ void
 semaphoreitem_watch(job_t j, struct semaphoreitem *si)
 {
 	char *parentdir, tmp_path[PATH_MAX];
-	const char *which_path = si->what;
 	int saved_errno = 0;
 	int fflags = NOTE_DELETE|NOTE_RENAME;
 
@@ -4256,20 +4255,18 @@ semaphoreitem_watch(job_t j, struct semaphoreitem *si)
 	/* See 5321044 for why we do the do-while loop and 5415523 for why ENOENT is checked */
 	do {
 		if (si->fd == -1) {
-			if ((si->fd = _fd(open(which_path, O_EVTONLY|O_NOCTTY))) == -1) {
-				which_path = parentdir;
-				si->watching_parent = true;
-				si->fd = _fd(open(which_path, O_EVTONLY|O_NOCTTY));
+			if ((si->fd = _fd(open(si->what, O_EVTONLY|O_NOCTTY))) == -1) {
+				si->watching_parent = job_assumes(j, (si->fd = _fd(open(parentdir, O_EVTONLY|O_NOCTTY))) != -1);
 			} else {
 				si->watching_parent = false;
 			}
 		}
 
 		if (si->fd == -1) {
-			return job_log_error(j, LOG_ERR, "Path monitoring failed on \"%s\"%s", si->what, si->watching_parent ? " (Could not monitor parent directory)" : "");
+			return job_log_error(j, LOG_ERR, "Path monitoring failed on \"%s\"", si->what);
 		}
 
-		job_log(j, LOG_DEBUG, "Watching %svnode: %d", si->watching_parent ? "parent ": "", si->fd);
+		job_log(j, LOG_DEBUG, "Watching %svnode (%s): %d", si->watching_parent ? "parent ": "", si->what, si->fd);
 
 		if (kevent_mod(si->fd, EVFILT_VNODE, EV_ADD, fflags, 0, j) == -1) {
 			saved_errno = errno;
@@ -4311,6 +4308,7 @@ semaphoreitem_callback(job_t j, struct kevent *kev)
 		case PATH_EXISTS:
 		case PATH_MISSING:
 		case DIR_NOT_EMPTY:
+			job_log(j, LOG_DEBUG, "P%s changed (%u): %s", si->watching_parent ? "arent path" : "ath", si->why, si->what);
 			break;
 		default:
 			continue;
@@ -4352,8 +4350,6 @@ semaphoreitem_callback(job_t j, struct kevent *kev)
 	}
 
 	if( !si->watching_parent ) {
-		job_log(j, LOG_DEBUG, "Watch path modified: %s", si->what);
-
 		if (si->why == PATH_CHANGES) {
 			j->start_pending = true;
 		}
@@ -4362,10 +4358,6 @@ semaphoreitem_callback(job_t j, struct kevent *kev)
 			job_assumes(j, runtime_close(si->fd) == 0);
 			si->fd = -1; /* this will get fixed in semaphoreitem_watch() */
 			semaphoreitem_watch(j, si);
-		}
-		
-		if( !si->watching_parent ) {
-			j->start_pending = true;
 		}
 	}
 	
@@ -4904,12 +4896,20 @@ job_keepalive(job_t j)
 			wanted_state = true;
 		case PATH_MISSING:
 			if ((bool)(stat(si->what, &sb) == 0) == wanted_state) {
-				if (si->fd != -1) {
-					job_assumes(j, runtime_close(si->fd) == 0);
-					si->fd = -1;
-				}
-				job_log(j, LOG_DEBUG, "KeepAlive: The following path %s: %s", wanted_state ? "exists" : "is missing", si->what);
+				job_log(j, LOG_NOTICE, "KeepAlive: The following path %s: %s", wanted_state ? "exists" : "is missing", si->what);
 				return true;
+			} else {
+				if( wanted_state ) { /* File is not there but we wish it was. */
+					if( si->fd != -1 && !si->watching_parent ) { /* Need to be watching the parent now. */
+						job_assumes(j, runtime_close(si->fd) == 0);
+						si->fd = -1;
+					}
+				} else { /* File is there but we wish it wasn't. */
+					if( si->fd != -1 && si->watching_parent ) { /* Need to watch the file now. */
+						job_assumes(j, runtime_close(si->fd) == 0);
+						si->fd = -1;
+					}
+				}
 			}
 			break;
 		case PATH_CHANGES:
@@ -5551,6 +5551,9 @@ jobmgr_init_session(jobmgr_t jm, const char *session_type, bool sflag)
 		if( jobmgr_assumes(jm, pid1_magic) ) {
 			/* Have our system bootstrapper print out to the console. */
 			bootstrapper->stdoutpath = _PATH_CONSOLE;
+		#if TARGET_OS_EMBEDDED
+			bootstrapper->stderrpath = _PATH_CONSOLE;
+		#endif
 		}
 	}
 	

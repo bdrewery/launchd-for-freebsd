@@ -1706,7 +1706,9 @@ system_specific_bootstrap(bool sflag)
 	}
 
 	assumes(touch_file(_PATH_UTMPX, DEFFILEMODE) != -1);
+#if !TARGET_OS_EMBEDDED
 	assumes(touch_file(_PATH_VARRUN "/.systemStarterRunning", DEFFILEMODE) != -1);
+#endif
 
 	if (path_check("/etc/security/rc.audit")) {
 		const char *audit_tool[] = { _PATH_BSHELL, "/etc/security/rc.audit", NULL };
@@ -1719,17 +1721,20 @@ system_specific_bootstrap(bool sflag)
 
 	_vproc_set_global_on_demand(true);
 
-	char *load_launchd_items[] = { "load", "-D", "all", "/etc/mach_init.d",
-#if TARGET_OS_EMBEDDED
-		"/var/mobile/Library/LaunchAgents",
+	
+#if !TARGET_OS_EMBEDDED
+	char *load_launchd_items[] = { "load", "-D", "all", "/etc/mach_init.d", NULL };
+	int load_launchd_items_cnt = 4;
+#else
+	char *load_launchd_items[] = { "load", "-D", "all", "/etc/mach_init.d",	"/var/mobile/Library/LaunchAgents", NULL };
+	int load_launchd_items_cnt = 5;
 #endif
-		NULL };
 
 	if (is_safeboot()) {
 		load_launchd_items[2] = "system";
 	}
 
-	assumes(load_and_unload_cmd(4, load_launchd_items) == 0);
+	assumes(load_and_unload_cmd(load_launchd_items_cnt, load_launchd_items) == 0);
 
 	/*
 	 * 5066316
