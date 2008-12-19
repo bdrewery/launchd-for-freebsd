@@ -5550,9 +5550,9 @@ jobmgr_init_session(jobmgr_t jm, const char *session_type, bool sflag)
 	} else if( bootstrapper && strncmp(session_type, VPROCMGR_SESSION_SYSTEM, sizeof(VPROCMGR_SESSION_SYSTEM)) == 0 ) {
 		if( jobmgr_assumes(jm, pid1_magic) ) {
 			/* Have our system bootstrapper print out to the console. */
-			bootstrapper->stdoutpath = _PATH_CONSOLE;
+			bootstrapper->stdoutpath = strdup(_PATH_CONSOLE);
 		#if TARGET_OS_EMBEDDED
-			bootstrapper->stderrpath = _PATH_CONSOLE;
+			bootstrapper->stderrpath = strdup(_PATH_CONSOLE);
 		#endif
 		}
 	}
