@@ -76,7 +76,7 @@ vproc_shmem_init(void)
 		 * counts if they're being run under a debugger. Moral of the story: Debug
 		 * from the environment you intend to run in.
 		 */
-		void *_vm_addr = malloc(sizeof(struct vproc_shmem_s));
+		void *_vm_addr = calloc(1, sizeof(struct vproc_shmem_s));
 		if( !_vm_addr ) {
 			return;
 		}
