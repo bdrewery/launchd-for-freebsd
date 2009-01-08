@@ -279,8 +279,19 @@ The maximum size (in bytes) which a process may lock into memory using the
 function.
 .It Sy NumberOfFiles <integer>
 The maximum number of open files for this process.
+Setting this value in a system wide daemon will set the 
+.Xr sysctl 3 
+kern.maxfiles (SoftResourceLimits) or kern.maxfilesperproc (HardResourceLimits) value in addition to the
+.Xr setrlimit 2
+values.
 .It Sy NumberOfProcesses <integer>
 The maximum number of simultaneous processes for this user id.
+Setting this value in a system wide daemon will set the 
+.Xr sysctl 3 
+kern.maxproc (SoftResourceLimits) or kern.maxprocperuid (HardResourceLimits) 
+value in addition to the
+.Xr setrlimit 2
+values.
 .It Sy ResidentSetSize <integer>
 The maximum size (in bytes) to which a process's resident set size may grow.
 This imposes a limit on the amount of physical memory to be given to a process;
@@ -451,5 +462,6 @@ Mac OS X System wide daemons.
 .Sh SEE ALSO 
 .Xr launchctl 1 ,
 .Xr launch 3 ,
+.Xr sysctl 3 ,
 .Xr launchd 8 ,
 .Xr plist 5
