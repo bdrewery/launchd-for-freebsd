@@ -193,6 +193,8 @@ main(int argc, char *const *argv)
 		if( stat("/var/db/.launchd_flat_per_user_namespace", &sb) == 0 ) {
 			runtime_syslog(LOG_NOTICE | LOG_CONSOLE, "Flat per-user Mach namespaces enabled.");
 		}
+		/* We just wanted to print status about the per-user namespace. PID 1 doesn't have a flat namespace. */
+		g_flat_mach_namespace = false;
 	}
 
 	monitor_networking_state();

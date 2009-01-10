@@ -82,6 +82,20 @@ static const char *const __rcs_file_version__ = "$Revision$";
 #if HAVE_QUARANTINE
 #include <quarantine.h>
 #endif
+#if TARGET_OS_EMBEDDED
+#include <sys/kern_memorystatus.h>
+#else
+/* To make my life easier. */
+typedef struct jetsam_priority_entry {
+    pid_t pid;
+    uint32_t flags;
+} jetsam_priority_entry_t;
+
+enum {
+    kJetsamFlagsFrontmost = (1 << 0),
+    kJetsamFlagsKilled =    (1 << 1)
+};
+#endif
 
 #include "launch.h"
 #include "launch_priv.h"
@@ -110,10 +124,11 @@ static const char *const __rcs_file_version__ = "$Revision$";
  *   If the job hasn't exited in the given number of seconds after sending
  *   it a SIGTERM, SIGKILL it. Can be overriden in the job plist.
  */
-#define LAUNCHD_MIN_JOB_RUN_TIME 10
-#define LAUNCHD_SAMPLE_TIMEOUT 1
-#define LAUNCHD_DEFAULT_EXIT_TIMEOUT 20
-#define LAUNCHD_SIGKILL_TIMER 5
+#define LAUNCHD_MIN_JOB_RUN_TIME		10
+#define LAUNCHD_SAMPLE_TIMEOUT			1
+#define LAUNCHD_DEFAULT_EXIT_TIMEOUT	20
+#define LAUNCHD_SIGKILL_TIMER			5
+#define LAUNCHD_JETSAM_PRIORITY_UNSET	0xdead1eebabell
 
 #define SHUTDOWN_LOG_DIR "/var/log/shutdown"
 
@@ -230,6 +245,7 @@ static void calendarinterval_sanity_check(void);
 
 struct envitem {
 	SLIST_ENTRY(envitem) sle;
+	bool one_shot;
 	char *value;
 	union {
 		const char key[0];
@@ -237,9 +253,10 @@ struct envitem {
 	};
 };
 
-static bool envitem_new(job_t j, const char *k, const char *v, bool global);
+static bool envitem_new(job_t j, const char *k, const char *v, bool global, bool one_shot);
 static void envitem_delete(job_t j, struct envitem *ei, bool global);
 static void envitem_setup(launch_data_t obj, const char *key, void *context);
+static void envitem_setup_one_shot(launch_data_t obj, const char *key, void *context);
 
 struct limititem {
 	SLIST_ENTRY(limititem) sle;
@@ -306,6 +323,7 @@ struct jobmgr_s {
 	SLIST_ENTRY(jobmgr_s) sle;
 	SLIST_HEAD(, jobmgr_s) submgrs;
 	LIST_HEAD(, job_s) jobs;
+	LIST_HEAD(, job_s) jetsam_jobs;
 	LIST_HEAD(, job_s) active_jobs[ACTIVE_JOB_HASH_SIZE];
 	LIST_HEAD(, machservice) ms_hash[MACHSERVICE_HASH_SIZE];
 	LIST_HEAD(, job_s) global_env_jobs;
@@ -317,6 +335,7 @@ struct jobmgr_s {
 	unsigned int global_on_demand_cnt;
 	unsigned int hopefully_first_cnt;
 	unsigned int normal_active_cnt;
+	unsigned int jetsam_jobs_cnt;
 	unsigned int 	sent_stop_to_normal_jobs		:1, 
 					sent_stop_to_hopefully_last_jobs:1, 
 					shutting_down					:1, 
@@ -364,8 +383,9 @@ static void jobmgr_log_bug(jobmgr_t jm, unsigned int line);
 #define AUTO_PICK_LEGACY_LABEL (const char *)(~0)
 
 struct job_s {
-	kq_callback kqjob_callback; /* MUST be first element of this structure for benefit of launchd's run loop. */
-	LIST_ENTRY(job_s) sle;
+	kq_callback kqjob_callback;	/* MUST be first element of this structure for benefit of launchd's run loop. */
+	LIST_ENTRY(job_s) sle;								
+	LIST_ENTRY(job_s) jetsam_sle;
 	LIST_ENTRY(job_s) pid_hash_sle;
 	LIST_ENTRY(job_s) label_hash_sle;
 	LIST_ENTRY(job_s) global_env_sle;
@@ -384,7 +404,7 @@ struct job_s {
 	cpu_type_t *j_binpref;
 	size_t j_binpref_cnt;
 	mach_port_t j_port;
-	mach_port_t wait_reply_port;	/* we probably should switch to a list of waiters */
+	mach_port_t wait_reply_port; /* we probably should switch to a list of waiters */
 	uid_t mach_uid;
 	jobmgr_t mgr;
 	size_t argc;
@@ -416,6 +436,7 @@ struct job_s {
 	int log_redirect_fd;
 	int nice;
 	int stdout_err_fd;
+	long long jetsam_priority;
 	uint32_t timeout;
 	uint32_t exit_timeout;
 	uint64_t sent_signal_time;
@@ -449,6 +470,7 @@ struct job_s {
 		    start_pending				:1,	/* an event fired and the job should start, but not necessarily right away */
 		    globargv					:1,	/* man launchd.plist --> EnableGlobbing */
 		    wait4debugger				:1,	/* man launchd.plist --> WaitForDebugger */
+			wait4debugger_oneshot		:1, /* One-shot WaitForDebugger. */
 		    internal_exc_handler		:1,	/* MachExceptionHandler == true */
 		    stall_before_exec			:1,	/* a hack to support an option of spawn_via_launchd() */
 		    only_once 					:1,	/* man launchd.plist --> LaunchOnlyOnce. Note: 5465184 Rename this to "HopefullyNeverExits" */
@@ -476,7 +498,8 @@ struct job_s {
 			reap_after_sample			:1,	/* The job exited before sample did, so we should reap it after sample is done. */
 			nosy						:1, /* The job has an OtherJobEnabled KeepAlive criterion. */
 			crashed						:1, /* The job is the default Mach exception handler, and it crashed. */
-			reaped						:1; /* We've received NOTE_EXIT for the job. */
+			reaped						:1, /* We've received NOTE_EXIT for the job. */
+			jetsam_frontmost			:1; /* The job is considered "frontmost" by Jetsam. */
 	mode_t mask;
 	pid_t sample_pid;
 	const char label[0];
@@ -570,6 +593,11 @@ static void extract_rcsid_substr(const char *i, char *o, size_t osz);
 static void do_first_per_user_launchd_hack(void);
 static void do_unmounts(void);
 void eliminate_double_reboot(void);
+
+/* For Jetsam. */
+static void jetsam_priority_from_job(job_t j, bool front, jetsam_priority_entry_t *jp);
+static int job_cmp(const job_t *lhs, const job_t *rhs);
+int launchd_set_jetsam_priorities(launch_data_t priorities);
 
 /* file local globals */
 static size_t total_children;
@@ -1175,9 +1203,15 @@ job_remove(job_t j, bool force)
 		/* Not a big deal if this fails. It means that the timer's already been freed. */
 		kevent_mod((uintptr_t)&j->exit_timeout, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
 	}
-
+	
+	if( j->jetsam_priority != LAUNCHD_JETSAM_PRIORITY_UNSET ) {
+		LIST_REMOVE(j, jetsam_sle);
+		j->mgr->jetsam_jobs_cnt--;
+	}
+	
 	kevent_mod((uintptr_t)j, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-
+	kevent_mod((uintptr_t)j, EVFILT_PROC, EV_DELETE, 0, 0, NULL);
+	
 	LIST_REMOVE(j, sle);
 	LIST_REMOVE(j, label_hash_sle);
 
@@ -1497,7 +1531,8 @@ job_new(jobmgr_t jm, const char *label, const char *prog, const char *const *arg
 	j->currently_ignored = true;
 	j->ondemand = true;
 	j->checkedin = true;
-
+	j->jetsam_priority = LAUNCHD_JETSAM_PRIORITY_UNSET;
+	
 	if (prog) {
 		j->prog = strdup(prog);
 		if (!job_assumes(j, j->prog != NULL)) {
@@ -1834,6 +1869,15 @@ job_import_integer(job_t j, const char *key, long long value)
 			} else {
 				j->exit_timeout = (typeof(j->exit_timeout)) value;
 			}
+		}
+		break;
+	case 'j':
+	case 'J':
+		if( strcasecmp(key, LAUNCH_JOBKEY_JETSAMPRIORITY) == 0 ) {
+			job_log(j, LOG_DEBUG, "Importing job with priority: %lld", value);
+			j->jetsam_priority = (typeof(j->jetsam_priority))value;
+			LIST_INSERT_HEAD(&j->mgr->jetsam_jobs, j, jetsam_sle);
+			j->mgr->jetsam_jobs_cnt++;
 		}
 		break;
 	case 'n':
@@ -2345,7 +2389,6 @@ job_mig_intran(mach_port_t p)
 	struct ldcred *ldc = runtime_get_caller_creds();
 	job_t jr;
 
-
 	jr = job_mig_intran2(root_jobmgr, p, ldc->pid);
 
 	if (!jobmgr_assumes(root_jobmgr, jr != NULL)) {
@@ -2486,6 +2529,8 @@ job_reap(job_t j)
 		int64_t junk = 0;
 		job_mig_swap_integer(j, VPROC_GSK_WEIRD_BOOTSTRAP, 0, 0, &junk);
 	}
+
+	j->wait4debugger_oneshot = false;
 
 	if (j->log_redirect_fd && !j->legacy_LS_job) {
 		job_log_stdouterr(j); /* one last chance */
@@ -2630,6 +2675,13 @@ job_reap(job_t j)
 			if( !msi->isActive && (msi->drain_one || msi->drain_all) ) {
 				machservice_drain_port(msi);
 			}
+		}
+	}
+	
+	struct envitem *ei = NULL, *et = NULL;
+	SLIST_FOREACH_SAFE( ei, &j->env, sle, et ) {
+		if( ei->one_shot ) {
+			SLIST_REMOVE(&j->env, ei, envitem, sle);
 		}
 	}
 	
@@ -3487,7 +3539,7 @@ job_start_child(job_t j)
 		argv++;
 	}
 
-	if (unlikely(j->wait4debugger)) {
+	if (unlikely(j->wait4debugger || j->wait4debugger_oneshot)) {
 		job_log(j, LOG_WARNING, "Spawned and waiting for the debugger to attach before continuing...");
 		spflags |= POSIX_SPAWN_START_SUSPENDED;
 	}
@@ -4624,7 +4676,7 @@ socketgroup_callback(job_t j)
 }
 
 bool
-envitem_new(job_t j, const char *k, const char *v, bool global)
+envitem_new(job_t j, const char *k, const char *v, bool global, bool one_shot)
 {
 	struct envitem *ei = calloc(1, sizeof(struct envitem) + strlen(k) + 1 + strlen(v) + 1);
 
@@ -4635,6 +4687,7 @@ envitem_new(job_t j, const char *k, const char *v, bool global)
 	strcpy(ei->key_init, k);
 	ei->value = ei->key_init + strlen(k) + 1;
 	strcpy(ei->value, v);
+	ei->one_shot = one_shot;
 
 	if (global) {
 		if (SLIST_EMPTY(&j->global_env)) {
@@ -4675,10 +4728,26 @@ envitem_setup(launch_data_t obj, const char *key, void *context)
 	}
 
 	if( strncmp(LAUNCHD_TRUSTED_FD_ENV, key, sizeof(LAUNCHD_TRUSTED_FD_ENV) - 1) != 0 ) {
-		envitem_new(j, key, launch_data_get_string(obj), j->importing_global_env);
+		envitem_new(j, key, launch_data_get_string(obj), j->importing_global_env, false);
 	} else {
 		job_log(j, LOG_WARNING, "Ignoring reserved environmental variable: %s", key);
 	}
+}
+
+void
+envitem_setup_one_shot(launch_data_t obj, const char *key, void *context)
+{
+	job_t j = context;
+	
+	if (launch_data_get_type(obj) != LAUNCH_DATA_STRING) {
+		return;
+	}
+	
+	if( strncmp(LAUNCHD_TRUSTED_FD_ENV, key, sizeof(LAUNCHD_TRUSTED_FD_ENV) - 1) != 0 ) {
+		envitem_new(j, key, launch_data_get_string(obj), j->importing_global_env, true);
+	} else {
+		job_log(j, LOG_WARNING, "Ignoring reserved environmental variable: %s", key);
+	}	
 }
 
 bool
@@ -5544,7 +5613,7 @@ jobmgr_init_session(jobmgr_t jm, const char *session_type, bool sflag)
 
 		/* <rdar://problem/5042202> launchd-201: can't ssh in with AFP OD account (hangs) */
 		snprintf(buf, sizeof(buf), "0x%X:0:0", getuid());
-		envitem_new(bootstrapper, "__CF_USER_TEXT_ENCODING", buf, false);
+		envitem_new(bootstrapper, "__CF_USER_TEXT_ENCODING", buf, false, false);
 		bootstrapper->weird_bootstrap = true;
 		jobmgr_assumes(jm, job_setup_machport(bootstrapper));
 	} else if( bootstrapper && strncmp(session_type, VPROCMGR_SESSION_SYSTEM, sizeof(VPROCMGR_SESSION_SYSTEM)) == 0 ) {
@@ -6423,7 +6492,7 @@ job_mig_swap_complex(job_t j, vproc_gsk_t inkey, vproc_gsk_t outkey,
 		vm_offset_t *outval, mach_msg_type_number_t *outvalCnt) 
 {
 	const char *action;
-	launch_data_t input_obj, output_obj;
+	launch_data_t input_obj = NULL, output_obj = NULL;
 	size_t data_offset = 0;
 	size_t packed_size;
 	struct ldcred *ldc = runtime_get_caller_creds();
@@ -6495,8 +6564,13 @@ job_mig_swap_complex(job_t j, vproc_gsk_t inkey, vproc_gsk_t outkey,
 	}
 
 	if (invalCnt) switch (inkey) {
-	case VPROC_GSK_ENVIRONMENT:
-		
+	case VPROC_GSK_ENVIRONMENT:	
+		if( launch_data_get_type(input_obj) == LAUNCH_DATA_DICTIONARY ) {
+			if( j->p ) {
+				job_log(j, LOG_NOTICE, "Setting environment for a currently active job. This environment will take effect on the next invocation of the job.");
+			}
+			launch_data_dict_iterate(input_obj, envitem_setup_one_shot, j);
+		}
 		break;
 	case 0:
 		break;
@@ -6587,6 +6661,9 @@ job_mig_swap_integer(job_t j, vproc_gsk_t inkey, vproc_gsk_t outkey, int64_t inv
 		job_log(j, LOG_DEBUG, "Reading transaction model status.");
 		*outval = j->kill_via_shmem;
 		break;
+	case VPROC_GSK_WAITFORDEBUGGER:
+		*outval = j->wait4debugger;
+		break;
 	case 0:
 		*outval = 0;
 		break;
@@ -6660,6 +6737,7 @@ job_mig_swap_integer(job_t j, vproc_gsk_t inkey, vproc_gsk_t outkey, int64_t inv
 			j->kill_via_shmem = (bool)inval;
 			job_log(j, LOG_DEBUG, "j->kill_via_shmem = %s", j->kill_via_shmem ? "true" : "false");
 		}
+		break;
 	case VPROC_GSK_WEIRD_BOOTSTRAP:
 		if( job_assumes(j, j->weird_bootstrap) ) {
 			job_log(j, LOG_DEBUG, "Unsetting weird bootstrap.");
@@ -6673,6 +6751,10 @@ job_mig_swap_integer(job_t j, vproc_gsk_t inkey, vproc_gsk_t outkey, int64_t inv
 			job_assumes(j, runtime_add_mport(j->mgr->jm_port, protocol_vproc_server, mxmsgsz) == KERN_SUCCESS);
 			j->weird_bootstrap = false;
 		}
+		break;
+	case VPROC_GSK_WAITFORDEBUGGER:
+		j->wait4debugger_oneshot = inval;
+		break;
 	case 0:
 		break;
 	default:
@@ -7347,6 +7429,31 @@ job_mig_pid_is_managed(job_t j __attribute__((unused)), pid_t p, boolean_t *mana
 	}
 	
 	return BOOTSTRAP_SUCCESS;
+}
+
+kern_return_t
+job_mig_port_for_label(job_t j __attribute__((unused)), name_t label, mach_port_t *mp)
+{
+	struct ldcred *ldc = runtime_get_caller_creds();
+	kern_return_t kr = BOOTSTRAP_NOT_PRIVILEGED;
+	
+	mach_port_t _mp = MACH_PORT_NULL;
+	if( ldc->euid == 0 || ldc->euid == geteuid() ) {
+		job_t target_j = job_find(label);
+		if( jobmgr_assumes(root_jobmgr, target_j != NULL) ) {
+			if( target_j->j_port == MACH_PORT_NULL ) {
+				job_assumes(target_j, job_setup_machport(target_j) == true);
+			}
+			
+			_mp = target_j->j_port;
+			kr = _mp != MACH_PORT_NULL ? BOOTSTRAP_SUCCESS : BOOTSTRAP_NO_MEMORY;
+		} else {
+			kr = BOOTSTRAP_NO_MEMORY;
+		}
+	}
+
+	*mp = _mp;
+	return kr;
 }
 
 jobmgr_t 
@@ -8188,4 +8295,121 @@ out:
 			jobmgr_log(root_jobmgr, LOG_WARNING | LOG_CONSOLE, "Deferred install script couldn't be removed!");
 		}
 	}
+}
+
+static void
+jetsam_priority_from_job(job_t j, bool front, jetsam_priority_entry_t *jp)
+{
+	jp->pid = j->p;
+	jp->flags |= front ? kJetsamFlagsFrontmost : 0;
+}
+
+static int
+job_cmp(const job_t *lhs, const job_t *rhs)
+{
+	job_t _lhs = *lhs;
+	job_t _rhs = *rhs;
+	/* Sort in descending order. (Priority correlates to the soonishness with which you will be killed.) */
+	if( _lhs->jetsam_priority > _rhs->jetsam_priority ) {
+		return -1;
+	} else if( _lhs->jetsam_priority < _rhs->jetsam_priority ) {
+		return 1;
+	}
+	
+	return 0;
+}
+
+int
+launchd_set_jetsam_priorities(launch_data_t priorities)
+{
+	if( !launchd_assumes(launch_data_get_type(priorities) == LAUNCH_DATA_ARRAY) ) {
+		return EINVAL;
+	}
+	
+	jobmgr_t jm = NULL;
+#if !TARGET_OS_EMBEDDED
+	/* For testing. */
+	jm = jobmgr_find_by_name(root_jobmgr, VPROCMGR_SESSION_AQUA);
+	if( !launchd_assumes(jm != NULL) ) {
+		return EINVAL;
+	}
+#else
+	/* Since this is for embedded, we can assume that the root job manager holds the Jetsam jobs. */
+	jm = root_jobmgr;
+#endif
+		
+	size_t npris = launch_data_array_get_count(priorities);
+
+	job_t ji = NULL;
+	size_t i = 0;
+	for( i = 0; i < npris; i++ ) {
+		launch_data_t ldi = launch_data_array_get_index(priorities, i);
+		if( !launchd_assumes(launch_data_get_type(ldi) == LAUNCH_DATA_DICTIONARY) ) {
+			continue;
+		}
+		
+		launch_data_t label = NULL;
+		if( !launchd_assumes(label = launch_data_dict_lookup(ldi, LAUNCH_KEY_JETSAMLABEL)) ) {
+			continue;
+		}
+		const char *_label = launch_data_get_string(label);
+		
+		ji = job_find(_label);
+		if( !launchd_assumes(ji != NULL) ) {
+			continue;
+		}
+		
+		launch_data_t pri;
+		long long _pri = 0;
+		if( !launchd_assumes(pri = launch_data_dict_lookup(ldi, LAUNCH_KEY_JETSAMPRIORITY)) ) {
+			continue;
+		}
+		_pri = launch_data_get_integer(pri);
+		
+		if( ji->jetsam_priority == LAUNCHD_JETSAM_PRIORITY_UNSET ) {
+			LIST_INSERT_HEAD(&ji->mgr->jetsam_jobs, ji, jetsam_sle);
+			ji->mgr->jetsam_jobs_cnt++;
+		}
+		ji->jetsam_priority = _pri;
+		
+		launch_data_t frontmost = NULL;
+		if( !(frontmost = launch_data_dict_lookup(ldi, LAUNCH_KEY_JETSAMFRONTMOST)) ) {
+			ji->jetsam_frontmost = false;
+			continue;
+		}
+		ji->jetsam_frontmost = launch_data_get_bool(frontmost);
+	}
+	
+	i = 0;
+	job_t *jobs = (job_t *)calloc(jm->jetsam_jobs_cnt, sizeof(job_t));
+	LIST_FOREACH( ji, &jm->jetsam_jobs, jetsam_sle ) {
+		if( ji->p ) {
+			jobs[i] = ji;
+			i++;
+		}
+	}
+	size_t totalpris = i;
+	
+	int result = EINVAL;
+	if( launchd_assumes(totalpris > 0) ) {
+		qsort((void *)jobs, totalpris, sizeof(job_t), (int (*)(const void *, const void *))job_cmp);
+		
+		jetsam_priority_entry_t *jpris = (jetsam_priority_entry_t *)calloc(totalpris, sizeof(jetsam_priority_entry_t));
+		if( !launchd_assumes(jpris != NULL) ) {
+			result = ENOMEM;
+		} else {
+			for( i = 0; i < totalpris; i++ ) {
+				jetsam_priority_from_job(jobs[i], jobs[i]->jetsam_frontmost, &jpris[i]);
+			}
+			
+			int _result = 0;
+			launchd_assumes((_result = sysctlbyname("kern.memorystatus_priority_list", NULL, NULL, &jpris[0], totalpris * sizeof(jetsam_priority_entry_t))) != -1);
+			result = _result != 0 ? errno : 0;
+			
+			free(jpris);
+		}
+	}
+	free(jobs);
+	
+	return result;
 }

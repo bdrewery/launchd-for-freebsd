@@ -34,7 +34,7 @@ __BEGIN_DECLS
 
 typedef void * vproc_err_t;
 
-typedef void * vproc_t;
+typedef struct vproc_s * vproc_t;
 typedef void * vprocmgr_t;
 
 const char *vproc_strerror(vproc_err_t r);

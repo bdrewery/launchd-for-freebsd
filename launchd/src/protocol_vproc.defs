@@ -199,3 +199,7 @@ routine pid_is_managed(
 				__pid				: pid_t;
 out				__managed			: boolean_t);
 
+routine port_for_label(
+				__bs_port			: job_t;
+				__label				: name_t;
+out				__mp				: mach_port_make_send_t);

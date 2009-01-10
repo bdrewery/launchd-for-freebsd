@@ -181,6 +181,7 @@ static int list_cmd(int argc, char *const argv[]);
 static int setenv_cmd(int argc, char *const argv[]);
 static int unsetenv_cmd(int argc, char *const argv[]);
 static int getenv_and_export_cmd(int argc, char *const argv[]);
+static int wait4debugger_cmd(int argc, char *const argv[]);
 
 static int limit_cmd(int argc, char *const argv[]);
 static int stdio_cmd(int argc, char *const argv[]);
@@ -216,6 +217,7 @@ static const struct {
 	{ "unsetenv",	unsetenv_cmd,			"Unset an environmental variable in launchd" },
 	{ "getenv",		getenv_and_export_cmd,	"Get an environmental variable from launchd" },
 	{ "export",		getenv_and_export_cmd,	"Export shell settings from launchd" },
+	{ "debug",		wait4debugger_cmd,		"Set the WaitForDebugger flag for the target job to true." },
 	{ "limit",		limit_cmd,				"View and adjust launchd resource limits" },
 	{ "stdout",		stdio_cmd,				"Redirect launchd's standard out to the given path" },
 	{ "stderr",		stdio_cmd,				"Redirect launchd's standard error to the given path" },
@@ -525,6 +527,37 @@ getenv_and_export_cmd(int argc, char *const argv[])
 	}
 
 	return 0;
+}
+
+int
+wait4debugger_cmd(int argc, char * const argv[])
+{
+	if( argc != 3 ) {
+		fprintf(stderr, "%s usage: debug <label> <value>\n", argv[0]);
+		return 1;
+	}
+	
+	int result = 1;
+	int64_t inval = 0;
+	if( strncmp(argv[2], "true", sizeof("true")) == 0 ) {
+		inval = 1;
+	} else if( strncmp(argv[2], "false", sizeof("false")) != 0 ) {
+		inval = atoi(argv[2]);
+		inval &= 1;
+	}
+	
+	vproc_t vp = vprocmgr_lookup_vproc(argv[1]);
+	if( vp ) {
+		vproc_err_t verr = vproc_swap_integer(vp, VPROC_GSK_WAITFORDEBUGGER, &inval, NULL);
+		if( verr ) {
+			fprintf(stderr, "Failed to set WaitForDebugger flag on %s.\n", argv[1]);
+		} else {
+			result = 0;
+		}
+		vproc_release(vp);
+	}
+	
+	return result;
 }
 
 void

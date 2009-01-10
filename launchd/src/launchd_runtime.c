@@ -131,7 +131,7 @@ bool pid1_magic;
 bool do_apple_internal_logging;
 bool low_level_debug;
 bool g_force_old_kill_path = false;
-bool g_flat_mach_namespace = false;
+bool g_flat_mach_namespace = true;
 
 mach_port_t
 runtime_get_kernel_port(void)
@@ -1743,7 +1743,7 @@ do_file_init(void)
 		g_force_old_kill_path = true;
 	}
 	
-	if( !pid1_magic && stat("/var/db/.launchd_flat_per_user_namespace", &sb) == 0 ) {
-		g_flat_mach_namespace = true;
+	if( !pid1_magic && stat("/var/db/.launchd_no_flat_per_user_namespace", &sb) == 0 ) {
+		g_flat_mach_namespace = false;
 	}
 }

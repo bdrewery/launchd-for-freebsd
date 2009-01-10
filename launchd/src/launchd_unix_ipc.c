@@ -415,6 +415,8 @@ ipc_readmsg2(launch_data_t data, const char *cmd, void *context)
 			resp = job_export(j);
 			ipc_revoke_fds(resp);
 		}
+	} else if( !strcmp(cmd, LAUNCH_KEY_SETPRIORITYLIST) ) {
+		resp = launch_data_new_errno(launchd_set_jetsam_priorities(data));
 	}
 
 	rmc->resp = resp;

@@ -56,4 +56,6 @@ void job_ack_no_senders(job_t j);
 void job_log(job_t j, int pri, const char *msg, ...) __attribute__((format(printf, 3, 4)));
 void job_set_pid_crashed(pid_t p);
 
+int launchd_set_jetsam_priorities(launch_data_t priorities);
+
 #endif

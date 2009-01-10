@@ -59,11 +59,16 @@ typedef enum {
 	VPROC_GSK_ABANDON_PROCESS_GROUP,
 	VPROC_GSK_TRANSACTIONS_ENABLED,
 	VPROC_GSK_WEIRD_BOOTSTRAP,
+	VPROC_GSK_WAITFORDEBUGGER,
 } vproc_gsk_t;
 
 typedef unsigned int vproc_flags_t;
 /* For _vproc_kickstart_by_label() -- instructs launchd to kickstart the job to stall before exec(2). */
 #define VPROCFLAG_STALL_JOB_EXEC	1 << 1
+
+vproc_t vprocmgr_lookup_vproc(const char *label);
+vproc_t vproc_retain(vproc_t vp);
+void vproc_release(vproc_t vp);
 
 vproc_err_t vproc_swap_integer(vproc_t vp, vproc_gsk_t key, int64_t *inval, int64_t *outval);
 vproc_err_t vproc_swap_complex(vproc_t vp, vproc_gsk_t key, launch_data_t inval, launch_data_t *outval);

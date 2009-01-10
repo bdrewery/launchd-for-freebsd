@@ -34,6 +34,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <assert.h>
+#include <libkern/OSAtomic.h>
+
 #if HAVE_QUARANTINE
 #include <quarantine.h>
 #endif
@@ -58,6 +60,55 @@ static int64_t cached_pid = -1;
 static struct vproc_shmem_s *vproc_shmem;
 static pthread_once_t shmem_inited = PTHREAD_ONCE_INIT;
 static uint64_t s_cached_transactions_enabled = 0;
+
+struct vproc_s {
+	int32_t refcount;
+	mach_port_t j_port;
+};
+
+vproc_t vprocmgr_lookup_vproc(const char *label)
+{
+	struct vproc_s *vp = NULL;
+	
+	mach_port_t mp = MACH_PORT_NULL;
+	kern_return_t kr = vproc_mig_port_for_label(bootstrap_port, (char *)label, &mp);
+	if( kr == BOOTSTRAP_SUCCESS ) {
+		vp = (struct vproc_s *)calloc(1, sizeof(struct vproc_s));
+		if( vp ) {
+			vp->refcount = 1;
+			mach_port_mod_refs(mach_task_self(), mp, MACH_PORT_RIGHT_SEND, 1);
+			vp->j_port = mp;
+		}
+		mach_port_mod_refs(mach_task_self(), mp, MACH_PORT_RIGHT_SEND, -1);
+	}
+	
+	return vp;
+}
+
+vproc_t vproc_retain(vproc_t vp)
+{
+	int32_t orig = OSAtomicAdd32(1, &vp->refcount) - 1;	
+	if( orig <= 0 ) {
+		/* We've gone from 0 to 1, which means that this object was due to be freed. */
+		__crashreporter_info__ = "Under-retain / over-release of vproc_t.";
+		abort();
+	}
+	
+	return vp;
+}
+
+void vproc_release(vproc_t vp)
+{
+	int32_t newval = OSAtomicAdd32(-1, &vp->refcount);
+	if( newval < 0 ) {
+		/* We're in negative numbers, which is bad. */
+		__crashreporter_info__ = "Over-release of vproc_t.";
+		abort();
+	} else if( newval == 0 ) {
+		mach_port_deallocate(mach_task_self(), vp->j_port);
+		free(vp);
+	}
+}
 
 static void
 vproc_shmem_init(void)
@@ -746,7 +797,7 @@ _vprocmgr_log_drain(vproc_t vp __attribute__((unused)), pthread_mutex_t *mutex, 
 }
 
 vproc_err_t
-vproc_swap_integer(vproc_t vp __attribute__((unused)), vproc_gsk_t key, int64_t *inval, int64_t *outval)
+vproc_swap_integer(vproc_t vp, vproc_gsk_t key, int64_t *inval, int64_t *outval)
 {
 	static int64_t cached_is_managed = -1;
 	int64_t dummyval = 0;
@@ -785,7 +836,8 @@ vproc_swap_integer(vproc_t vp __attribute__((unused)), vproc_gsk_t key, int64_t 
 		break;
 	}
 
-	if (vproc_mig_swap_integer(bootstrap_port, inval ? key : 0, outval ? key : 0, inval ? *inval : 0, outval ? outval : &dummyval) == 0) {
+	mach_port_t mp = vp ? vp->j_port : bootstrap_port;
+	if (vproc_mig_swap_integer(mp, inval ? key : 0, outval ? key : 0, inval ? *inval : 0, outval ? outval : &dummyval) == 0) {
 		switch (key) {
 		case VPROC_GSK_MGR_PID:
 			cached_pid = outval ? *outval : dummyval;
@@ -832,7 +884,7 @@ get_root_bootstrap_port(void)
 }
 
 vproc_err_t
-vproc_swap_complex(vproc_t vp __attribute__((unused)), vproc_gsk_t key, launch_data_t inval, launch_data_t *outval)
+vproc_swap_complex(vproc_t vp, vproc_gsk_t key, launch_data_t inval, launch_data_t *outval)
 {
 	size_t data_offset = 0, good_enough_size = 10*1024*1024;
 	mach_msg_type_number_t indata_cnt = 0, outdata_cnt;
@@ -853,7 +905,8 @@ vproc_swap_complex(vproc_t vp __attribute__((unused)), vproc_gsk_t key, launch_d
 		indata = (vm_offset_t)buf;
 	}
 
-	if (vproc_mig_swap_complex(bootstrap_port, inval ? key : 0, outval ? key : 0, indata, indata_cnt, &outdata, &outdata_cnt) != 0) {
+	mach_port_t mp = vp ? vp->j_port : bootstrap_port;
+	if (vproc_mig_swap_complex(mp, inval ? key : 0, outval ? key : 0, indata, indata_cnt, &outdata, &outdata_cnt) != 0) {
 		goto out;
 	}
 

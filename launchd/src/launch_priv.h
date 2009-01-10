@@ -38,7 +38,8 @@ __BEGIN_DECLS
 #define LAUNCH_KEY_SETRESOURCELIMITS					"SetResourceLimits"
 #define LAUNCH_KEY_GETRUSAGESELF						"GetResourceUsageSelf"
 #define LAUNCH_KEY_GETRUSAGECHILDREN					"GetResourceUsageChildren"
-                                                    
+#define LAUNCH_KEY_SETPRIORITYLIST						"SetPriorityList"
+
 #define LAUNCHD_SOCKET_ENV								"LAUNCHD_SOCKET"
 #define LAUNCHD_SOCK_PREFIX								_PATH_VARTMP "launchd"
 #define LAUNCHD_TRUSTED_FD_ENV							"__LAUNCHD_FD"
@@ -46,12 +47,17 @@ __BEGIN_DECLS
 #define LAUNCH_KEY_BATCHCONTROL							"BatchControl"
 #define LAUNCH_KEY_BATCHQUERY							"BatchQuery"
 #define LAUNCHD_DO_APPLE_INTERNAL_LOGGING				"__DoAppleInternalLogging__"
-                                                    
+
+#define LAUNCH_KEY_JETSAMLABEL							"JetsamLabel"
+#define LAUNCH_KEY_JETSAMFRONTMOST						"JetsamFrontmost"
+#define LAUNCH_KEY_JETSAMPRIORITY						"JetsamPriority"
+
 #define LAUNCH_JOBKEY_TRANSACTIONCOUNT					"TransactionCount"
 #define LAUNCH_JOBKEY_QUARANTINEDATA					"QuarantineData"
 #define LAUNCH_JOBKEY_SANDBOXPROFILE					"SandboxProfile"
 #define LAUNCH_JOBKEY_SANDBOXFLAGS						"SandboxFlags"
 #define LAUNCH_JOBKEY_SANDBOX_NAMED						"Named"
+#define LAUNCH_JOBKEY_JETSAMPRIORITY					"JetsamPriority"
 
 #define LAUNCH_JOBKEY_ENTERKERNELDEBUGGERBEFOREKILL		"EnterKernelDebuggerBeforeKill"
 #define LAUNCH_JOBKEY_PERJOBMACHSERVICES				"PerJobMachServices"
