@@ -116,6 +116,7 @@ static void sock_dict_edit_entry(launch_data_t tmp, const char *key, launch_data
 static launch_data_t CF2launch_data(CFTypeRef);
 static launch_data_t read_plist_file(const char *file, bool editondisk, bool load);
 static CFPropertyListRef CreateMyPropertyListFromFile(const char *);
+static CFPropertyListRef CFPropertyListCreateFromFile(CFURLRef plistURL);
 static void WriteMyPropertyListToFile(CFPropertyListRef, const char *);
 static bool path_goodness_check(const char *path, bool forceload);
 static void readpath(const char *, struct load_unload_state *);
@@ -158,6 +159,7 @@ static void do_bootroot_magic(void);
 static void do_single_user_mode(bool);
 static bool do_single_user_mode2(void);
 static void read_launchd_conf(void);
+static void read_environment_dot_plist(void);
 static bool job_disabled_logic(launch_data_t obj);
 static void fix_bogus_file_metadata(void);
 static void do_file_init(void) __attribute__((constructor));
@@ -413,6 +415,96 @@ read_launchd_conf(void)
 	}
 
 	fclose(f);
+}
+
+CFPropertyListRef CFPropertyListCreateFromFile(CFURLRef plistURL)
+{	
+	CFReadStreamRef plistReadStream = CFReadStreamCreateWithFile(NULL, plistURL);
+	
+	CFErrorRef streamErr = NULL;
+	if( !CFReadStreamOpen(plistReadStream) ) {
+		streamErr = CFReadStreamCopyError(plistReadStream);
+		CFStringRef errString = CFErrorCopyDescription(streamErr);
+		
+		CFShow(errString);
+		
+		CFRelease(errString);
+		CFRelease(streamErr);
+	}
+	
+	CFPropertyListRef plist = NULL;
+	if( plistReadStream ) {
+		CFStringRef errString = NULL;
+		CFPropertyListFormat plistFormat = 0;
+		plist = CFPropertyListCreateFromStream(NULL, plistReadStream, 0, kCFPropertyListImmutable, &plistFormat, &errString);
+		if( !plist ) {
+			CFShow(errString);
+			CFRelease(errString);
+		}
+	}
+	
+	CFReadStreamClose(plistReadStream);
+	CFRelease(plistReadStream);
+	
+	return plist;
+}
+
+#define CFReleaseIfNotNULL(cf) if( cf ) CFRelease(cf);
+void
+read_environment_dot_plist(void)
+{
+	CFStringRef plistPath = NULL;
+	CFURLRef plistURL = NULL;
+	CFDictionaryRef envPlist = NULL;
+	launch_data_t req = NULL, launch_env_dict = NULL, resp = NULL;
+	
+	plistPath = CFStringCreateWithFormat(NULL, NULL, CFSTR("%s/.MacOSX/environment.plist"), getenv("HOME"));
+	if( !assumes(plistPath != NULL) ) {
+		goto out;
+	}
+	
+	plistURL = CFURLCreateWithFileSystemPath(NULL, plistPath, kCFURLPOSIXPathStyle, false);
+	if( !assumes(plistURL != NULL) ) {
+		goto out;
+	}
+	
+	envPlist = (CFDictionaryRef)CFPropertyListCreateFromFile(plistURL);
+	if( !assumes(envPlist != NULL) ) {
+		goto out;
+	}
+	
+	launch_env_dict = CF2launch_data(envPlist);
+	if( !assumes(launch_env_dict != NULL) ) {
+		goto out;
+	}
+	
+	req = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+	if( !assumes(req != NULL) ) {
+		goto out;
+	}
+	
+	launch_data_dict_insert(req, launch_env_dict, LAUNCH_KEY_SETUSERENVIRONMENT);
+	resp = launch_msg(req);
+	if( !assumes(resp != NULL) ) {
+		goto out;
+	}
+	
+	if( !assumes(launch_data_get_type(resp) == LAUNCH_DATA_ERRNO) ) {
+		goto out;
+	}
+
+	assumes(launch_data_get_errno(resp) == 0);
+out:
+	CFReleaseIfNotNULL(plistPath);
+	CFReleaseIfNotNULL(plistURL);
+	CFReleaseIfNotNULL(envPlist);	
+	if( req ) {
+		launch_data_free(req);
+	}
+	
+	if( resp ) {
+		launch_data_free(resp);
+	}
 }
 
 int
@@ -1897,7 +1989,7 @@ bootstrap_cmd(int argc, char *const argv[])
 		if (is_safeboot()) {
 			load_launchd_items[4] = "system";
 		}
-
+		
 		if (strcasecmp(session_type, VPROCMGR_SESSION_BACKGROUND) == 0 || strcasecmp(session_type, VPROCMGR_SESSION_LOGINWINDOW) == 0) {
 			load_launchd_items[4] = "system";
 			if (!is_safeboot()) {
@@ -1937,6 +2029,18 @@ bootstrap_cmd(int argc, char *const argv[])
 			 * agents.
 			 */
 			the_argc_user = 5;
+			
+			/* We want to read environment.plist, which is in the user's home directory.
+			 * Since the dance to mount a network home directory is fairly complex, all we
+			 * can do is try and read environment.plist when bootstrapping the Aqua session,
+			 * which is when we assume the home directory is present.
+			 *
+			 * The drawback here is that jobs bootstrapped in the Background session won't
+			 * get the new environment until they quit and relaunch. But then again, they 
+			 * won't get the updated HOME directory or anything either. This is just a messy
+			 * problem.
+			 */
+			read_environment_dot_plist();
 		} else if (strcasecmp(session_type, VPROCMGR_SESSION_AQUA) == 0) {
 			/* If we're bootstrapping the StandardIO session, bootstrap the user's Background
 			 * agents.

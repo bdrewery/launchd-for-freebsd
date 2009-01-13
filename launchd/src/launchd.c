@@ -175,15 +175,13 @@ main(int argc, char *const *argv)
 		ipc_server_init();
 		
 		runtime_log_push();
-
-		int64_t now = runtime_get_wall_time();
 		
 		struct passwd *pwent = getpwuid(getuid());
 		if( pwent ) {
 			strlcpy(g_username, pwent->pw_name, sizeof(g_username) - 1);
 		}
 		
-		runtime_syslog(LOG_NOTICE, "Per-user launchd for UID %u (%s) began at: %lld.%06llu", getuid(), g_username, now / USEC_PER_SEC, now % USEC_PER_SEC);
+		runtime_syslog(LOG_DEBUG, "Per-user launchd for UID %u (%s) has begun.", getuid(), g_username);
 	}
 
 	if( pid1_magic ) {

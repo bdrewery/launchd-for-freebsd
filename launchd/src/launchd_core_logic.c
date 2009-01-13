@@ -336,9 +336,7 @@ struct jobmgr_s {
 	unsigned int hopefully_first_cnt;
 	unsigned int normal_active_cnt;
 	unsigned int jetsam_jobs_cnt;
-	unsigned int 	sent_stop_to_normal_jobs		:1, 
-					sent_stop_to_hopefully_last_jobs:1, 
-					shutting_down					:1, 
+	unsigned int 	shutting_down					:1,
 					session_initialized				:1, 
 					killed_hopefully_first_jobs		:1,
 					killed_normal_jobs				:1,
@@ -357,16 +355,19 @@ struct jobmgr_s {
 static jobmgr_t jobmgr_new(jobmgr_t jm, mach_port_t requestorport, mach_port_t transfer_port, bool sflag, const char *name);
 static job_t jobmgr_import2(jobmgr_t jm, launch_data_t pload);
 static jobmgr_t jobmgr_parent(jobmgr_t jm);
+static jobmgr_t jobmgr_do_hopefully_first_shutdown_phase(jobmgr_t jm);
+static jobmgr_t jobmgr_do_normal_shutdown_phase(jobmgr_t jm);
+static jobmgr_t jobmgr_do_hopefully_last_shutdown_phase(jobmgr_t jm);
 static jobmgr_t jobmgr_do_garbage_collection(jobmgr_t jm);
 static bool jobmgr_label_test(jobmgr_t jm, const char *str);
 static void jobmgr_reap_bulk(jobmgr_t jm, struct kevent *kev);
-static void jobmgr_log_stray_children(jobmgr_t jm);
+static void jobmgr_log_stray_children(jobmgr_t jm, bool kill_strays);
 static void jobmgr_kill_stray_child(jobmgr_t jm, pid_t p);
 static void jobmgr_remove(jobmgr_t jm, bool expect_real_jobs);
 static void jobmgr_dispatch_all(jobmgr_t jm, bool newmounthack);
 static void jobmgr_dequeue_next_sample(jobmgr_t jm);
 static job_t jobmgr_init_session(jobmgr_t jm, const char *session_type, bool sflag);
-static job_t jobmgr_find_by_pid_deep(jobmgr_t jm, pid_t p);
+static job_t jobmgr_find_by_pid_deep(jobmgr_t jm, pid_t p, bool anon_okay);
 static job_t jobmgr_find_by_pid(jobmgr_t jm, pid_t p, bool create_anon);
 static jobmgr_t jobmgr_find_by_name(jobmgr_t jm, const char *where);
 static job_t job_mig_intran2(jobmgr_t jm, mach_port_t mport, pid_t upid);
@@ -499,6 +500,7 @@ struct job_s {
 			nosy						:1, /* The job has an OtherJobEnabled KeepAlive criterion. */
 			crashed						:1, /* The job is the default Mach exception handler, and it crashed. */
 			reaped						:1, /* We've received NOTE_EXIT for the job. */
+			stopped						:1, /* job_stop() was called. */
 			jetsam_frontmost			:1; /* The job is considered "frontmost" by Jetsam. */
 	mode_t mask;
 	pid_t sample_pid;
@@ -591,7 +593,6 @@ static char **mach_cmd2argv(const char *string);
 static size_t our_strhash(const char *s) __attribute__((pure));
 static void extract_rcsid_substr(const char *i, char *o, size_t osz);
 static void do_first_per_user_launchd_hack(void);
-static void do_unmounts(void);
 void eliminate_double_reboot(void);
 
 /* For Jetsam. */
@@ -737,6 +738,8 @@ job_stop(job_t j)
 
 		job_log(j, LOG_DEBUG, "Sent SIGTERM signal%s", extralog);
 	}
+	
+	j->stopped = true;
 }
 
 launch_data_t
@@ -894,88 +897,12 @@ jobmgr_still_alive_with_check(jobmgr_t jm)
 {
 	jobmgr_log(jm, LOG_NOTICE | LOG_CONSOLE, "Still alive with %lu/%lu (normal/anonymous) children", total_children, total_anon_children);
 	jobmgr_log_active_jobs(jm);
-	
-	if( pid1_magic && jm == root_jobmgr ) {
-		/* Take the opportunity to shut the system down if it presents itself. */
-		if( total_children == 0 ) {
-			jobmgr_log(jm, LOG_DEBUG | LOG_CONSOLE, "No more non-anonymous children left. Shutting down the system.");
-			jobmgr_log_stray_children(jm);
-			jobmgr_remove(jm, false);
-		}
-		
-		unsigned int unkilled_jobs = 0;
-		job_t ji = NULL;
-		char *type = NULL;
-		if( !jm->killed_hopefully_first_jobs ) {
-			LIST_FOREACH( ji, &jm->jobs, sle ) {
-				if( ji->hopefully_exits_first && !ji->sent_sigkill && !ji->anonymous ) {
-					job_log(ji, LOG_DEBUG | LOG_CONSOLE, "Hopefully First job has not yet been sent SIGKILL.");
-					unkilled_jobs++;
-				}
-			}
-
-			type = "hopefully first";
-			if( unkilled_jobs == 0 ) {
-				jm->killed_hopefully_first_jobs = true;
-			}
-		} else if( !jm->killed_normal_jobs ) {
-			LIST_FOREACH( ji, &jm->jobs, sle ) {
-				if( !ji->hopefully_exits_first && !ji->hopefully_exits_last && !ji->sent_sigkill && !ji->anonymous ) {
-					job_log(ji, LOG_DEBUG | LOG_CONSOLE, "Normal job has not yet been sent SIGKILL.");
-					unkilled_jobs++;
-				}
-			}
-
-			type = "normal";
-			if( unkilled_jobs == 0 ) {
-				jm->killed_normal_jobs = true;
-			}
-		} else if( !jm->killed_hopefully_last_jobs ) {
-			LIST_FOREACH( ji, &jm->jobs, sle ) {
-				if( ji->hopefully_exits_last && !ji->sent_sigkill && !ji->anonymous ) {
-					job_log(ji, LOG_DEBUG | LOG_CONSOLE, "Hopefully Last job has not yet been sent SIGKILL.");
-					unkilled_jobs++;
-				}
-			}
-
-			type = "hopefully last";
-			if( unkilled_jobs == 0 ) {
-				jm->killed_hopefully_last_jobs = true;
-			}
-		}
-
-		/* Our club-over-the-head solution to rdar://problem/5054857.
-		 * If all remaining jobs in the PID 1 launchd have been sent SIGKILL, wash our hands of them. This way,
-		 * unkillable processes don't hold up shutdown for customers. Disable this behavior for AppleInternal,
-		 * since we still want to catch kernel bugs and processes that don't properly terminate when receiving
-		 * SIGKILL. See jobmgr_do_garbage_collection() for the rest.
-		 */
-		if( unkilled_jobs == 0 && jm->killed_hopefully_last_jobs ) {
-			if( !do_apple_internal_logging ) {
-				jobmgr_assumes(jm, kevent_mod((uintptr_t)jm, EVFILT_TIMER, EV_DELETE, 0, 0, NULL) != -1);
-				jobmgr_log(root_jobmgr, LOG_NOTICE | LOG_CONSOLE, "All remaining non-anonymous jobs have died or been sent SIGKILL. Shutting down the system.");
-				jobmgr_log_stray_children(jm);
-				runtime_closelog(); /* hack to flush logs */
-				jobmgr_remove(jm, true);
-			} else {
-				jobmgr_log(root_jobmgr, LOG_NOTICE | LOG_CONSOLE, "All remaining non-anonymous jobs have died or been sent SIGKILL. On a customer-facing system, we would call reboot() at this point.");
-			}
-		} else if( unkilled_jobs != 0 ) {
-			jobmgr_log(jm, LOG_NOTICE | LOG_CONSOLE, "Still have %u %s non-anonymous job%s that %s not been sent SIGKILL.", unkilled_jobs, type, unkilled_jobs > 1 ? "s" : "", unkilled_jobs > 1 ? "have" : "has");
-		} else {
-			jobmgr_do_garbage_collection(jm);
-		}
-	}
-
-	runtime_closelog(); /* hack to flush logs */
 }
 
 jobmgr_t
 jobmgr_shutdown(jobmgr_t jm)
 {
 	jobmgr_t jmi, jmn;
-	job_t ji;
-
 	jobmgr_log(jm, LOG_DEBUG, "Beginning job manager shutdown with flags: %s", reboot_flags_to_C_names(jm->reboot_flags));
 
 	jm->shutting_down = true;
@@ -983,15 +910,7 @@ jobmgr_shutdown(jobmgr_t jm)
 	SLIST_FOREACH_SAFE(jmi, &jm->submgrs, sle, jmn) {
 		jobmgr_shutdown(jmi);
 	}
-
-	if (jm->hopefully_first_cnt) {
-		LIST_FOREACH(ji, &jm->jobs, sle) {
-			if (ji->p && ji->hopefully_exits_first) {
-				job_stop(ji);
-			}
-		}
-	}
-
+	
 	if (jm->parentmgr == NULL && pid1_magic) {
 		jobmgr_assumes(jm, kevent_mod((uintptr_t)jm, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, 5, jm));
 	}
@@ -1013,11 +932,11 @@ jobmgr_remove(jobmgr_t jm, bool expect_real_jobs)
 	}
 
 	while( (ji = LIST_FIRST(&jm->jobs)) ) {
-		if( !expect_real_jobs && !job_assumes(ji, ji->anonymous) ) {
+		if( !expect_real_jobs && ji->p && !job_assumes(ji, ji->anonymous) ) {
 			job_log(ji, LOG_WARNING | LOG_CONSOLE, "%s() called incorrectly with non-anonymous job still active. Forcing removal.", __func__);
 			job_remove(ji, true);
 		} else {
-			if( !ji->anonymous ) {
+			if( !ji->anonymous && ji->p ) {
 				job_log(ji, LOG_WARNING | LOG_CONSOLE, "Job has overstayed its welcome. Forcing removal.");
 				job_remove(ji, true);
 			} else {
@@ -1039,18 +958,13 @@ jobmgr_remove(jobmgr_t jm, bool expect_real_jobs)
 		SLIST_REMOVE(&jm->parentmgr->submgrs, jm, jobmgr_s, sle);
 	} else if (pid1_magic) {
 		eliminate_double_reboot();
-		jobmgr_log(jm, LOG_DEBUG | LOG_CONSOLE, "About to call: sync()");
-		sync(); /* We're are going to rely on log timestamps to benchmark this call */
-		jobmgr_log(jm, LOG_DEBUG | LOG_CONSOLE, "Unmounting all filesystems except / and /dev");
-		do_unmounts();
 		launchd_log_vm_stats();
 		jobmgr_log(root_jobmgr, LOG_NOTICE | LOG_CONSOLE, "About to call: reboot(%s).", reboot_flags_to_C_names(jm->reboot_flags));
 		runtime_closelog();
 		jobmgr_assumes(jm, reboot(jm->reboot_flags) != -1);
-		runtime_closelog();
 	} else {
-		runtime_closelog();
 		jobmgr_log(jm, LOG_DEBUG, "About to exit");
+		runtime_closelog();
 		exit(EXIT_SUCCESS);
 	}
 	
@@ -1198,12 +1112,10 @@ job_remove(job_t j, bool force)
 	if (j->poll_for_vfs_changes) {
 		job_assumes(j, kevent_mod((uintptr_t)&j->semaphores, EVFILT_TIMER, EV_DELETE, 0, 0, j) != -1);
 	}
-
 	if( j->exit_timeout ) {
 		/* Not a big deal if this fails. It means that the timer's already been freed. */
 		kevent_mod((uintptr_t)&j->exit_timeout, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
 	}
-	
 	if( j->jetsam_priority != LAUNCHD_JETSAM_PRIORITY_UNSET ) {
 		LIST_REMOVE(j, jetsam_sle);
 		j->mgr->jetsam_jobs_cnt--;
@@ -2323,18 +2235,18 @@ job_find(const char *label)
 
 /* Should try and consolidate with job_mig_intran2() and jobmgr_find_by_pid(). */
 job_t
-jobmgr_find_by_pid_deep(jobmgr_t jm, pid_t p)
+jobmgr_find_by_pid_deep(jobmgr_t jm, pid_t p, bool anon_okay)
 {
 	job_t ji = NULL;
 	LIST_FOREACH( ji, &jm->active_jobs[ACTIVE_JOB_HASH(p)], pid_hash_sle ) {
-		if (ji->p == p && !ji->anonymous) {
+		if (ji->p == p && (!ji->anonymous || (ji->anonymous && anon_okay)) ) {
 			return ji;
 		}
 	}
 
 	jobmgr_t jmi = NULL;
 	SLIST_FOREACH( jmi, &jm->submgrs, sle ) {
-		if( (ji = jobmgr_find_by_pid_deep(jmi, p)) ) {
+		if( (ji = jobmgr_find_by_pid_deep(jmi, p, anon_okay)) ) {
 			break;
 		}
 	}
@@ -2642,7 +2554,7 @@ job_reap(job_t j)
 
 	if (WIFSIGNALED(status)) {
 		int s = WTERMSIG(status);
-		if (SIGKILL == s || SIGTERM == s) {
+		if ((SIGKILL == s || SIGTERM == s) && !j->stopped) {
 			job_log(j, LOG_NOTICE, "Exited: %s", strsignal(s));
 		} else {
 			switch( s ) {
@@ -2698,6 +2610,10 @@ job_reap(job_t j)
 	j->lastlookup = NULL;
 	j->lastlookup_gennum = 0;
 	j->p = 0;
+
+	if( !j->anonymous ) {
+		jobmgr_do_garbage_collection(j->mgr);
+	}
 
 	/*
 	 * We need to someday evaluate other jobs and find those who wish to track the
@@ -2951,7 +2867,7 @@ job_log_stdouterr(job_t j)
 	if (unlikely(rsz == 0)) {
 		job_log(j, LOG_DEBUG, "Standard out/error pipe closed");
 		close_log_redir = true;
-	} else if (!job_assumes(j, rsz != -1)) {
+	} else if (!job_assumes(j, rsz != -1 && errno != EAGAIN)) {
 		close_log_redir = true;
 	} else {
 		buf[rsz] = '\0';
@@ -3099,8 +3015,8 @@ job_callback_proc(job_t j, struct kevent *kev)
 			struct kinfo_proc kp;
 			size_t len = sizeof(kp);
 
-			if (job_assumes(j, sysctl(mib, 4, &kp, &len, NULL, 0) != -1)
-					&& job_assumes(j, len == sizeof(kp))) {
+			/* Sometimes, the kernel says it succeeded but really didn't. */
+			if (job_assumes(j, sysctl(mib, 4, &kp, &len, NULL, 0) != -1) && len == sizeof(kp)) {
 				char newlabel[1000];
 
 				snprintf(newlabel, sizeof(newlabel), "%p.%s", j, kp.kp_proc.p_comm);
@@ -3212,6 +3128,7 @@ job_callback_timer(job_t j, void *ident)
 				}
 				job_log(j, LOG_WARNING | LOG_CONSOLE, "Exit timeout elapsed (%u seconds). Killing", j->exit_timeout);
 				job_kill(j);
+				jobmgr_do_garbage_collection(j->mgr);
 			}
 		}
 	} else {
@@ -3433,7 +3350,8 @@ job_start(job_t j)
 		j->start_pending = false;
 		j->reaped = false;
 		j->crashed = false;
-
+		j->stopped = false;
+			
 		runtime_add_ref();
 		total_children++;
 		LIST_INSERT_HEAD(&j->mgr->active_jobs[ACTIVE_JOB_HASH(c)], j, pid_hash_sle);
@@ -4171,9 +4089,17 @@ job_logv(job_t j, int pri, int err, const char *msg, va_list ap)
 	newmsg = alloca(newmsgsz);
 
 	if (err) {
+	#if !TARGET_OS_EMBEDDED
 		snprintf(newmsg, newmsgsz, "%s: %s", msg, strerror(err));
+	#else
+		snprintf(newmsg, newmsgsz, "(%s) %s: %s", j->label, msg, strerror(err));
+	#endif
 	} else {
+	#if !TARGET_OS_EMBEDDED
 		snprintf(newmsg, newmsgsz, "%s", msg);
+	#else
+		snprintf(newmsg, newmsgsz, "(%s) %s", j->label, msg);
+	#endif
 	}
 
 	if (unlikely(j->debug)) {
@@ -5001,7 +4927,6 @@ const char *
 job_active(job_t j)
 {
 	struct machservice *ms;
-
 	if (j->p) {
 		return "PID is still valid";
 	}
@@ -5267,90 +5192,182 @@ machservice_setup(launch_data_t obj, const char *key, void *context)
 }
 
 jobmgr_t
-jobmgr_do_garbage_collection(jobmgr_t jm)
+jobmgr_do_hopefully_first_shutdown_phase(jobmgr_t jm)
 {
-	jobmgr_t jmi, jmn;
-	job_t ji, jn;
-
-	SLIST_FOREACH_SAFE(jmi, &jm->submgrs, sle, jmn) {
-		jobmgr_do_garbage_collection(jmi);
+	jobmgr_t _jm = jm;
+	if( !jm->shutting_down ) {
+		return _jm;
 	}
-
-	if (likely(!jm->shutting_down)) {
-		return jm;
-	}
-
-	jobmgr_log(jm, LOG_DEBUG, "Garbage collecting.");
-
-	if (jm->hopefully_first_cnt && !jm->killed_hopefully_first_jobs) {
-		jobmgr_log(jm, LOG_DEBUG, "jm->hopefully_first_cnt = %u, jm->killed_hopefully_first_jobs = %s", jm->hopefully_first_cnt, jm->killed_hopefully_first_jobs ? "true" : "false");
-		return jm;
-	}
-
-	if (jm->parentmgr && jm->parentmgr->shutting_down && jm->parentmgr->hopefully_first_cnt) {
-		return jm;
-	}
-
-	if (!jm->sent_stop_to_normal_jobs) {
-		jobmgr_log(jm, LOG_DEBUG, "Asking \"normal\" jobs to exit.");
-
-		LIST_FOREACH_SAFE(ji, &jm->jobs, sle, jn) {
-			if (!job_active(ji)) {
-				job_remove(ji, false);
-			} else if (!ji->hopefully_exits_last) {
-				job_stop(ji);
+	
+	bool should_proceed = !jm->killed_hopefully_first_jobs;
+	
+	job_t ji = NULL, jn = NULL;
+	if( should_proceed ) {
+		jobmgr_log(jm, LOG_DEBUG, "Doing first phase of garbage collection.");
+		uint32_t unkilled_cnt = 0;
+		LIST_FOREACH_SAFE( ji, &jm->jobs, sle, jn ) {
+			if( jm->parentmgr ) {
+				job_log(ji, LOG_DEBUG, "Examining...");
 			}
-		}
-
-		jm->sent_stop_to_normal_jobs = true;
-	}
-
-	if (jm->normal_active_cnt && !jm->killed_normal_jobs) {
-		jobmgr_log(jm, LOG_DEBUG, "jm->normal_active_cnt = %u, jm->killed_normal_jobs = %s", jm->normal_active_cnt, jm->killed_normal_jobs ? "true" : "false");
-		return jm;
-	}
-
-	if (!jm->sent_stop_to_hopefully_last_jobs) {
-		jobmgr_log(jm, LOG_DEBUG, "Asking \"hopefully last\" jobs to exit.");
-
-		LIST_FOREACH(ji, &jm->jobs, sle) {
-			if (ji->p && ji->anonymous) {
-				continue;
-			} else if (ji->p && job_assumes(ji, ji->hopefully_exits_last)) {
-				job_stop(ji);
-			}
-		}
-
-		jm->sent_stop_to_hopefully_last_jobs = true;
-	}
-
-	if (!SLIST_EMPTY(&jm->submgrs)) {
-		jobmgr_log(jm, LOG_DEBUG, "jm->submgrs not empty!");
-		return jm;
-	}
-
-	jobmgr_t retval = NULL;
-	if( pid1_magic && jm == root_jobmgr ) {
-		if( total_children > 0 && !jm->killed_hopefully_last_jobs ) {
-			retval = jm;
-		} else {
-			jobmgr_log_stray_children(jm);
-			jobmgr_remove(jm, total_children == 0 ? false : true);
-		}
-	} else {
-		LIST_FOREACH(ji, &jm->jobs, sle) {
-			if (!ji->anonymous) {
-				retval = jm;
+			if( ji->hopefully_exits_first ) {
+				bool active = job_active(ji);
+				if( active && !ji->stopped ) {
+					job_stop(ji);
+					
+					/* We may have sent SIGKILL to the job in job_stop(). */
+					unkilled_cnt += !ji->sent_sigkill ? 1 : 0;
+				} else if( ji->stopped ) {
+					unkilled_cnt += !ji->sent_sigkill ? 1 : 0;
+				} else if( !active ) {
+					job_remove(ji, false);
+				}
 			}
 		}
 		
-		if( !retval ) {
-			jobmgr_log_stray_children(jm);
-			jobmgr_remove(jm, false);
+		/* If we've killed everyone, move on. */
+		if( unkilled_cnt == 0 ) {
+			jm->killed_hopefully_first_jobs = true;
+			_jm = NULL;
 		}
+	} else {
+		jm->killed_hopefully_first_jobs = true;
+		_jm = NULL;
 	}
 	
-	return retval;
+	return _jm;
+}
+
+jobmgr_t
+jobmgr_do_normal_shutdown_phase(jobmgr_t jm)
+{
+	jobmgr_t _jm = jm;
+	if( !jm->shutting_down ) {
+		return _jm;
+	}
+	
+	bool should_proceed = !jm->killed_normal_jobs;
+	
+	job_t ji = NULL, jn = NULL;
+	if( should_proceed ) {
+		jobmgr_log(jm, LOG_DEBUG, "Doing second phase of garbage collection.");
+		uint32_t unkilled_cnt = 0;
+		LIST_FOREACH_SAFE( ji, &jm->jobs, sle, jn ) {
+			if( jm->parentmgr ) {
+				job_log(ji, LOG_DEBUG, "Examining...");
+			}
+			
+			if( !(ji->hopefully_exits_first || ji->hopefully_exits_last) && !ji->anonymous ) {
+				bool active = job_active(ji);
+				if( active && !ji->stopped ) {
+					job_stop(ji);
+					
+					/* We may have sent SIGKILL to the job in job_stop(). */
+					unkilled_cnt += !ji->sent_sigkill ? 1 : 0;
+				} else if( ji->stopped ) {
+					unkilled_cnt += !ji->sent_sigkill ? 1 : 0;
+				} else if( !active ) {
+					job_remove(ji, false);
+				}
+			}
+		}
+		
+		/* If we've killed everyone, move on. */
+		if( unkilled_cnt == 0 ) {
+			jm->killed_normal_jobs = true;
+			_jm = NULL;
+		}
+	} else {
+		jm->killed_normal_jobs = true;
+		_jm = NULL;
+	}
+	
+	return _jm;
+}
+
+jobmgr_t
+jobmgr_do_hopefully_last_shutdown_phase(jobmgr_t jm)
+{
+	jobmgr_t _jm = jm;
+	if( !jm->shutting_down ) {
+		return _jm;
+	}
+	
+	static bool killed_stray_jobs = false;
+	if( !killed_stray_jobs ) {
+		jobmgr_log_stray_children(jm, true);
+		killed_stray_jobs = true;
+	}
+	
+	bool should_proceed = !jm->killed_hopefully_last_jobs && total_children != 0;
+	
+	job_t ji = NULL, jn = NULL;
+	if( should_proceed ) {
+		jobmgr_log(jm, LOG_DEBUG, "Doing third phase of garbage collection.");
+		uint32_t unkilled_cnt = 0;
+		LIST_FOREACH_SAFE( ji, &jm->jobs, sle, jn ) {
+			if( jm->parentmgr ) {
+				job_log(ji, LOG_DEBUG, "Examining...");
+			}
+			if( ji->hopefully_exits_last ) {
+				bool active = job_active(ji);
+				if( active && !ji->stopped ) {
+					job_stop(ji);
+					
+					/* We may have sent SIGKILL to the job in job_stop(). */
+					unkilled_cnt += !ji->sent_sigkill ? 1 : 0;
+				} else if( ji->stopped ) {
+					unkilled_cnt += !ji->sent_sigkill ? 1 : 0;
+				} else if( !active ) {
+					job_remove(ji, false);
+				}
+			}
+		}
+		
+		/* If we've killed everyone, move on. */
+		if( unkilled_cnt == 0 ) {
+			jm->killed_hopefully_last_jobs = true;
+			_jm = NULL;
+		}
+	} else {
+		jm->killed_hopefully_last_jobs = true;
+		_jm = NULL;
+	}
+	
+	return _jm;
+}
+
+jobmgr_t
+jobmgr_do_garbage_collection(jobmgr_t jm)
+{
+	if( !jm->shutting_down ) {
+		return jm;
+	}
+	
+	jobmgr_t jmi = NULL, jmn = NULL;
+	SLIST_FOREACH_SAFE(jmi, &jm->submgrs, sle, jmn) {
+		jobmgr_do_garbage_collection(jmi);
+	}
+	
+	jobmgr_t _jm = jobmgr_do_hopefully_first_shutdown_phase(jm);
+	if( !_jm ) {
+		_jm = jobmgr_do_normal_shutdown_phase(jm) ? : jobmgr_do_hopefully_last_shutdown_phase(jm);
+	}
+	
+	if( !_jm ) {
+		jobmgr_log(jm, LOG_NOTICE | LOG_CONSOLE, "Removing.");
+		jobmgr_log_stray_children(jm, false);
+		
+		job_t ji = NULL;
+		LIST_FOREACH( ji, &jm->jobs, sle ) {
+			if( !job_assumes(ji, (ji->anonymous || ji->sent_sigkill) && ji->p) ) {
+				job_log(ji, LOG_NOTICE | LOG_CONSOLE, "Job should be gone but is not.");
+			}
+		}
+		
+		jobmgr_remove(jm, total_children != 0);
+	}
+	
+	return _jm;
 }
 
 void
@@ -5402,15 +5419,11 @@ out:
 }
 
 void
-jobmgr_log_stray_children(jobmgr_t jm)
+jobmgr_log_stray_children(jobmgr_t jm, bool kill_strays)
 {
 	int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
 	size_t i, kp_cnt = 0, kp_skipped = 0, len = sizeof(struct kinfo_proc) * get_kern_max_proc();
 	struct kinfo_proc *kp;
-
-	if (!do_apple_internal_logging) {
-		return;
-	}
 
 	if (likely(jm->parentmgr || !pid1_magic)) {
 		return;
@@ -5443,10 +5456,9 @@ jobmgr_log_stray_children(jobmgr_t jm)
 		/* We might have some jobs hanging around that we've decided to shut down in spite of. */
 		job_t j = jobmgr_find_by_pid(jm, p_i, false);
 		if( !j || (j && j->anonymous) ) {
-			jobmgr_log(jm, LOG_WARNING, "Stray %s %s at shutdown: PID %u PPID %u PGID %u %s", z, j ? "anonymous job" : "process", p_i, pp_i, pg_i, n);
+			jobmgr_log(jm, LOG_WARNING | LOG_CONSOLE, "Stray %s %s at shutdown: PID %u PPID %u PGID %u %s", z, j ? "anonymous job" : "process", p_i, pp_i, pg_i, n);
 			
-			/* <rdar://problem/6399100> Let the kernel clean up the stragglers. */
-			if( 0 ) {
+			if( kill_strays ) {
 				jobmgr_kill_stray_child(jm, p_i);
 			}
 		}
@@ -5680,18 +5692,29 @@ jobmgr_lookup_service(jobmgr_t jm, const char *name, bool check_parent, pid_t ta
 	struct machservice *ms;
 	job_t target_j;
 
-	if (target_pid) {
-		//jobmgr_assumes(jm, !check_parent);
-		if (unlikely((target_j = jobmgr_find_by_pid(jm, target_pid, false)) == NULL)) {
-			return NULL;
-		}
+	jobmgr_log(jm, LOG_DEBUG, "Looking up %sservice %s", target_pid ? "per-PID " : "", name);
 
+	if (target_pid) {
+		/* This is a hack to let FileSyncAgent look up per-PID Mach services from the Background
+		 * bootstrap in other bootstraps.
+		 */
+		
+		/* Start in the given bootstrap. */
+		if( unlikely((target_j = jobmgr_find_by_pid(jm, target_pid, false)) == NULL) ) {
+			/* If we fail, do a deep traversal. */
+			if (unlikely((target_j = jobmgr_find_by_pid_deep(root_jobmgr, target_pid, true)) == NULL)) {
+				jobmgr_log(jm, LOG_DEBUG, "Didn't find PID %i", target_pid);
+				return NULL;
+			}
+		}
+		
 		SLIST_FOREACH(ms, &target_j->machservices, sle) {
 			if (ms->per_pid && strcmp(name, ms->name) == 0) {
 				return ms;
 			}
 		}
 
+		job_log(target_j, LOG_DEBUG, "Didn't find per-PID Mach service: %s", name);
 		return NULL;
 	}
 	
@@ -6309,7 +6332,7 @@ job_mig_setup_shmem(job_t j, mach_port_t *shmem_port)
 	}
 
 	if (unlikely(j->anonymous)) {
-		job_log(j, LOG_ERR, "Anonymous job tried to setup shared memory");
+		job_log(j, LOG_DEBUG, "Anonymous job tried to setup shared memory");
 		return BOOTSTRAP_NOT_PRIVILEGED;
 	}
 
@@ -7261,7 +7284,7 @@ job_mig_lookup_children(job_t j,	mach_port_array_t *child_ports,					mach_msg_ty
 	
 	struct ldcred *ldc = runtime_get_caller_creds();
 	
-	/* Only allow root processes to look up children, even if we're in the per-user laucnhd.
+	/* Only allow root processes to look up children, even if we're in the per-user launchd.
 	 * Otherwise, this could be used to cross sessions, which counts as a security vulnerability
 	 * in a non-flat namespace.
 	 */
@@ -7389,7 +7412,7 @@ job_mig_transaction_count_for_pid(job_t j, pid_t p, int32_t *cnt, boolean_t *con
 		return BOOTSTRAP_NOT_PRIVILEGED;
 	}
 	
-	job_t j_for_pid = jobmgr_find_by_pid_deep(j->mgr, p);
+	job_t j_for_pid = jobmgr_find_by_pid_deep(j->mgr, p, false);
 	if( j_for_pid ) {
 		if( j_for_pid->kill_via_shmem ) {
 			if( j_for_pid->shmem ) {
@@ -7423,7 +7446,7 @@ job_mig_pid_is_managed(job_t j __attribute__((unused)), pid_t p, boolean_t *mana
 	/* This is so loginwindow doesn't try to quit GUI apps that have been launched
 	 * directly by launchd as agents.
 	 */
-	job_t j_for_pid = jobmgr_find_by_pid_deep(root_jobmgr, p);
+	job_t j_for_pid = jobmgr_find_by_pid_deep(root_jobmgr, p, false);
 	if( j_for_pid && !j_for_pid->anonymous && !j_for_pid->legacy_LS_job ) {
 		*managed = true;
 	}
@@ -7493,8 +7516,6 @@ jobmgr_find_by_name(jobmgr_t jm, const char *where)
 			}
 		}
 	}
-
-	launchd_assumes(jmi != NULL);
 	
 jm_found:
 	return jmi;
@@ -8196,39 +8217,6 @@ waiting4removal_delete(job_t j, struct waiting_for_removal *w4r)
 	SLIST_REMOVE(&j->removal_watchers, w4r, waiting_for_removal, sle);
 
 	free(w4r);
-}
-
-void
-do_unmounts(void)
-{
-	struct statfs buf[250];
-	int r, i, found, returned;
-
-	do {
-		returned = getfsstat(buf, (int) sizeof(buf), MNT_NOWAIT);
-		found = 0;
-
-		if (!launchd_assumes(returned != -1)) {
-			return;
-		}
-
-		/* Work backwards due to mounts on top of mounts */
-		for (i = returned - 1; i >= 0; i--) {
-			if (strcmp(buf[i].f_mntonname, "/") == 0) {
-				continue;
-			} else if (strncmp(buf[i].f_mntonname, "/dev", strlen("/dev")) == 0) {
-				continue;
-			}
-
-			r = unmount(buf[i].f_mntonname, 0);
-
-			runtime_syslog(LOG_DEBUG, "unmount(\"%s\", 0): %s", buf[i].f_mntonname, r == -1 ? strerror(errno) : "Success");
-
-			if (r != -1) {
-				found++;
-			}
-		}
-	} while ((returned == (sizeof(buf) / sizeof(buf[0]))) && (found > 0));
 }
 
 size_t

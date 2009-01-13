@@ -131,15 +131,7 @@ vproc_shmem_init(void)
 		if( !_vm_addr ) {
 			return;
 		}
-		
-		_vproc_log(LOG_WARNING,
-					"Using private memory for transactions. You are likely running under a launchd agent or daemon under a debugger.\n"
-					"Please keep the following considerations in mind.\n"
-					"0. This process is not actually participating in Instant Off. It will only be able to keep track of its transaction count.\n"
-					"1. This process will not die after cleaning up its last transaction after it has received SIGTERM.\n"
-					"2. You are debugging your program in an environment that is very different from the one it will run under.\n"
-					"3. You can use the WaitForDebugger key to stall execution of your daemon or agent so that you can attach to it. See launchd.plist(5). "
-					"This only applies if you are debugging a launchd daemon or agent. If you are debugging a GUI application under Xcode, this consideration does not apply.\n");
+
 		vm_addr = (vm_address_t)_vm_addr;
 	} else {
 		kr = vm_map(mach_task_self(), &vm_addr, getpagesize(), 0, true, shmem_port, 0, false,
@@ -245,7 +237,12 @@ kern_return_t
 _vproc_transaction_count_for_pid(pid_t p, int32_t *count, bool *condemned)
 {
 	boolean_t _condemned = false;
-	return vproc_mig_transaction_count_for_pid(bootstrap_port, p, count, (boolean_t *)condemned ? : &_condemned);
+	kern_return_t kr = vproc_mig_transaction_count_for_pid(bootstrap_port, p, count, &_condemned);
+	if( kr == KERN_SUCCESS ) {
+		*condemned = _condemned ? true : false;
+	}
+	
+	return kr;
 }
 
 void
