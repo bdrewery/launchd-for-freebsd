@@ -238,7 +238,7 @@ _vproc_transaction_count_for_pid(pid_t p, int32_t *count, bool *condemned)
 {
 	boolean_t _condemned = false;
 	kern_return_t kr = vproc_mig_transaction_count_for_pid(bootstrap_port, p, count, &_condemned);
-	if( kr == KERN_SUCCESS ) {
+	if( kr == KERN_SUCCESS && condemned ) {
 		*condemned = _condemned ? true : false;
 	}
 	
